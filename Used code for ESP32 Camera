@@ -1,0 +1,462 @@
+/*
+ * ESP32-CAM Controller with OCR Integration
+ * Captures images and coordinates with Python OCR system
+ */
+
+ #include "esp_camera.h"
+ #include <WiFi.h>
+ #include <WebServer.h>
+ #include <HTTPClient.h>
+ #include <ArduinoJson.h>
+ 
+ // WiFi credentials - UPDATE THESE WITH YOUR NETWORK
+const char* ssid = "imf";
+const char* password = "7C4C7DF1";
+
+// Python OCR server details (computer running the OCR code)
+const char* ocr_server_ip = "192.168.8.113"; // Your computer's IP
+const int ocr_server_port = 8081;
+ 
+ // Web server
+ WebServer server(80);
+ 
+ // Camera pin definitions for AI-THINKER ESP32-CAM
+ #define PWDN_GPIO_NUM     32
+ #define RESET_GPIO_NUM    -1
+ #define XCLK_GPIO_NUM      0
+ #define SIOD_GPIO_NUM     26
+ #define SIOC_GPIO_NUM     27
+ #define Y9_GPIO_NUM       35
+ #define Y8_GPIO_NUM       34
+ #define Y7_GPIO_NUM       39
+ #define Y6_GPIO_NUM       36
+ #define Y5_GPIO_NUM       21
+ #define Y4_GPIO_NUM       19
+ #define Y3_GPIO_NUM       18
+ #define Y2_GPIO_NUM        5
+ #define VSYNC_GPIO_NUM    25
+ #define HREF_GPIO_NUM     23
+ #define PCLK_GPIO_NUM     22
+ 
+ // Flash LED pin (disabled - no flash functionality)
+// #define FLASH_LED_PIN 4
+ 
+ void setup() {
+   Serial.begin(115200);
+   Serial.setDebugOutput(true);
+     Serial.println("ESP32-CAM OCR System Starting (NO FLASH)...");
+
+  // Initialize camera
+  if (!initCamera()) {
+    Serial.println("❌ Camera init failed!");
+    ESP.restart();
+  }
+  
+  // Configure camera sensor for natural light OCR
+  configureCameraSensor();
+   
+     // Flash LED disabled - no initialization needed
+  Serial.println("Flash LED disabled - using natural light only");
+   
+   // Connect to WiFi
+   WiFi.begin(ssid, password);
+   Serial.print("Connecting to WiFi");
+   
+   while (WiFi.status() != WL_CONNECTED) {
+     delay(1000);
+     Serial.print(".");
+   }
+   
+   Serial.println();
+   Serial.println("WiFi connected!");
+   Serial.print("ESP32-CAM IP address: ");
+   Serial.println(WiFi.localIP());
+   
+   // Setup web server routes
+   setupRoutes();
+   
+   // Start server
+   server.begin();
+     Serial.println("HTTP server started");
+  Serial.println("✅ Ready to capture and process digits (NO FLASH MODE)!");
+  Serial.println("📸 Direct capture: http://" + WiFi.localIP().toString() + "/capture");
+  Serial.println("🤖 OCR endpoint: http://" + WiFi.localIP().toString() + "/capture_and_ocr");
+ }
+ 
+ void loop() {
+   server.handleClient();
+   delay(10);
+ }
+ 
+ bool initCamera() {
+  // Power cycle camera first for stability
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);
+  delay(100);
+  digitalWrite(PWDN_GPIO_NUM, LOW);
+  delay(100);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  // Try multiple times with different settings for reliability
+  for (int attempt = 0; attempt < 3; attempt++) {
+    Serial.printf("Camera init attempt %d...\n", attempt + 1);
+    
+    // Adjust settings per attempt
+    switch(attempt) {
+      case 0:
+        config.frame_size = FRAMESIZE_SVGA; // 800x600 - best for OCR
+        config.jpeg_quality = 10; // High quality
+        config.fb_count = 2;
+        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+        break;
+      case 1:
+        config.frame_size = FRAMESIZE_VGA; // 640x480
+        config.jpeg_quality = 12;
+        config.fb_count = 1;
+        break;
+      case 2:
+        config.frame_size = FRAMESIZE_CIF; // 352x288
+        config.jpeg_quality = 15;
+        config.fb_count = 1;
+        break;
+    }
+
+    esp_err_t err = esp_camera_init(&config);
+    if (err == ESP_OK) {
+      Serial.printf("✅ Camera initialized successfully on attempt %d\n", attempt + 1);
+      
+      // Test capture immediately
+      camera_fb_t* test_fb = esp_camera_fb_get();
+      if (test_fb && test_fb->len > 5000) {
+        Serial.printf("✅ Test capture successful: %d bytes\n", test_fb->len);
+        esp_camera_fb_return(test_fb);
+        return true;
+      } else {
+        Serial.println("❌ Test capture failed, retrying...");
+        if (test_fb) esp_camera_fb_return(test_fb);
+        esp_camera_deinit();
+        delay(1000);
+      }
+    } else {
+      Serial.printf("❌ Camera init failed with error 0x%x\n", err);
+      delay(1000);
+    }
+  }
+  
+    return false;
+}
+
+void configureCameraSensor() {
+  sensor_t* s = esp_camera_sensor_get();
+  if (s == NULL) {
+    Serial.println("❌ Failed to get camera sensor");
+    return;
+  }
+
+  // Optimized settings for digit recognition (no flash)
+  s->set_brightness(s, 0);       // -2 to 2
+  s->set_contrast(s, 1);         // Increased for better digit edges
+  s->set_saturation(s, -1);      // Slightly desaturated
+  s->set_special_effect(s, 0);   // No effects
+  s->set_whitebal(s, 1);         // Enable white balance
+  s->set_awb_gain(s, 1);         // Enable AWB gain
+  s->set_wb_mode(s, 0);          // Auto white balance
+  s->set_exposure_ctrl(s, 1);    // Enable exposure control
+  s->set_aec2(s, 0);             // Disable AEC2
+  s->set_ae_level(s, 0);         // Auto exposure level
+  s->set_aec_value(s, 400);      // Slightly higher exposure for no flash
+  s->set_gain_ctrl(s, 1);        // Enable gain control
+  s->set_agc_gain(s, 2);         // Moderate gain for low light
+  s->set_gainceiling(s, (gainceiling_t)2);
+  s->set_bpc(s, 1);              // Enable BPC
+  s->set_wpc(s, 1);              // Enable WPC
+  s->set_raw_gma(s, 1);          // Enable raw GMA
+  s->set_lenc(s, 1);             // Enable lens correction
+  s->set_hmirror(s, 0);          // No horizontal mirror
+  s->set_vflip(s, 0);            // No vertical flip
+  s->set_dcw(s, 1);              // Enable DCW
+  s->set_colorbar(s, 0);         // Disable color bar
+  
+  Serial.println("✅ Camera sensor configured for natural light OCR");
+}
+
+// Function to force clear camera buffer completely
+void forceClearCameraBuffer() {
+  Serial.println("🧹 FORCE CLEARING CAMERA BUFFER...");
+  
+  // Method 1: Multiple rapid captures and discards
+  for (int i = 0; i < 10; i++) {
+    camera_fb_t* discard_fb = esp_camera_fb_get();
+    if (discard_fb) {
+      Serial.printf("🗑️ Discarded buffer frame %d: %d bytes\n", i + 1, discard_fb->len);
+      esp_camera_fb_return(discard_fb);
+      delay(25); // Short delay between discards
+    } else {
+      break;
+    }
+  }
+  
+  // Method 2: Give camera time to capture fresh frame
+  Serial.println("⏱️ Camera stabilization delay...");
+  delay(300);
+  
+  // Method 3: One more flush cycle
+  camera_fb_t* final_flush = esp_camera_fb_get();
+  if (final_flush) {
+    Serial.printf("🗑️ Final flush: %d bytes\n", final_flush->len);
+    esp_camera_fb_return(final_flush);
+  }
+  
+  delay(100);
+  Serial.println("✅ Buffer clearing complete - ready for fresh capture");
+}
+ 
+ void setupRoutes() {
+   // Basic capture endpoint (existing)
+   server.on("/capture", HTTP_GET, handleCapture);
+   
+   // New endpoint for capture + OCR
+   server.on("/capture_and_ocr", HTTP_GET, handleCaptureAndOCR);
+   
+   // Status endpoint
+   server.on("/", HTTP_GET, handleRoot);
+   
+   // Stream endpoint (existing)
+   server.on("/stream", HTTP_GET, handleStream);
+ }
+ 
+ void handleRoot() {
+   String html = "<h1>ESP32-CAM OCR System</h1>";
+   html += "<p><a href='/capture'>Capture Image</a></p>";
+   html += "<p><a href='/capture_and_ocr'>Capture and Process Digit</a></p>";
+   html += "<p><a href='/stream'>Video Stream</a></p>";
+   html += "<p>Status: Ready</p>";
+   server.send(200, "text/html", html);
+ }
+ 
+ // Enhanced camera capture with aggressive buffer flushing (no flash)
+camera_fb_t* robustCameraCapture(int max_retries = 5) {
+  camera_fb_t* fb = NULL;
+  
+  Serial.println("🔄 AGGRESSIVE BUFFER FLUSH - Clearing old cached frames...");
+  
+  // AGGRESSIVE BUFFER FLUSHING - Clear ALL old cached frames
+  for (int flush_count = 0; flush_count < 5; flush_count++) {
+    camera_fb_t* flush_fb = esp_camera_fb_get();
+    if (flush_fb) {
+      Serial.printf("🗑️ Flushed cached frame %d: %d bytes\n", flush_count + 1, flush_fb->len);
+      esp_camera_fb_return(flush_fb);
+      delay(50); // Small delay between flushes
+    } else {
+      break; // No more cached frames
+    }
+  }
+  
+  Serial.println("⏱️ Waiting for camera to stabilize...");
+  delay(200); // Give camera time to stabilize after flush
+  
+  for (int attempt = 0; attempt < max_retries; attempt++) {
+    Serial.printf("📸 Fresh capture attempt %d/%d (post-flush)\n", attempt + 1, max_retries);
+    
+    // Additional flush between attempts if needed
+    if (attempt > 0) {
+      camera_fb_t* flush_fb = esp_camera_fb_get();
+      if (flush_fb) {
+        Serial.printf("🗑️ Mid-attempt flush: %d bytes\n", flush_fb->len);
+        esp_camera_fb_return(flush_fb);
+      }
+      delay(150); // Longer delay between attempts
+    }
+    
+    fb = esp_camera_fb_get();
+    
+    if (fb != NULL && fb->len > 5000 && fb->buf != NULL) {
+      Serial.printf("✅ Fresh capture successful: %d bytes\n", fb->len);
+      return fb;
+    } else {
+      if (fb) {
+        Serial.printf("❌ Invalid fresh frame: size=%d, buf=%p\n", fb->len, fb->buf);
+        esp_camera_fb_return(fb);
+        fb = NULL;
+      } else {
+        Serial.println("❌ Fresh capture returned NULL");
+      }
+    }
+    
+    delay(200 * (attempt + 1)); // Progressive delays
+  }
+  
+  Serial.println("❌ All fresh capture attempts failed");
+  return NULL;
+}
+
+void handleCapture() {
+  Serial.println("\n📸 === CAPTURE REQUEST (NO FLASH) ===");
+  
+  // Clear buffer for fresh capture
+  forceClearCameraBuffer();
+  
+  // NO FLASH - Using natural light only
+  Serial.println("📷 Capturing FRESH image with natural light...");
+  
+  camera_fb_t * fb = robustCameraCapture(5);
+  
+  if (!fb) {
+    Serial.println("❌ Camera capture failed after multiple attempts");
+    server.send(500, "text/plain", "Camera capture failed - check lighting and camera");
+    return;
+  }
+  
+  Serial.printf("✅ Camera capture successful: %d bytes\n", fb->len);
+  
+  server.sendHeader("Content-Disposition", "attachment; filename=capture.jpg");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send_P(200, "image/jpeg", (const char *)fb->buf, fb->len);
+  
+  esp_camera_fb_return(fb);
+  Serial.println("📸 === CAPTURE COMPLETE ===\n");
+}
+ 
+ void handleCaptureAndOCR() {
+ Serial.println("\n🤖 === CAPTURE AND OCR REQUEST (NO FLASH) ===");
+ 
+ // CRITICAL: Force clear buffer before OCR capture to prevent old images
+ forceClearCameraBuffer();
+ 
+ // NO FLASH - Using natural light for OCR
+ Serial.println("📷 Capturing FRESH image for OCR with natural light...");
+ 
+ camera_fb_t * fb = robustCameraCapture(5);
+ 
+ if (!fb) {
+   Serial.println("❌ Camera capture failed for OCR after multiple attempts");
+   String errorResponse = "{\"success\":false,\"error\":\"Camera capture failed - check lighting\"}";
+   server.send(500, "application/json", errorResponse);
+   return;
+ }
+ 
+    Serial.printf("✅ Camera capture for OCR successful: %d bytes\n", fb->len);
+   
+   // Send image to Python OCR server
+   String digit = processImageWithOCR(fb->buf, fb->len);
+   
+   esp_camera_fb_return(fb);
+   
+   // Prepare JSON response
+   JsonDocument doc;
+   
+   if (digit != "") {
+     doc["success"] = true;
+     doc["digit"] = digit;
+     doc["timestamp"] = millis();
+     Serial.println("🎯 OCR Success - Digit: " + digit);
+   } else {
+     doc["success"] = false;
+     doc["error"] = "OCR processing failed - no digit detected (check lighting)";
+     Serial.println("❌ OCR Failed - No digit detected");
+   }
+   
+   String response;
+   serializeJson(doc, response);
+   
+   server.send(doc["success"] ? 200 : 500, "application/json", response);
+   Serial.println("🤖 === OCR REQUEST COMPLETE ===\n");
+ }
+ 
+ String processImageWithOCR(const uint8_t* imageData, size_t imageSize) {
+  HTTPClient http;
+  
+  String url = "http://" + String(ocr_server_ip) + ":" + String(ocr_server_port) + "/process_image";
+  
+  Serial.println("Sending image to OCR server: " + url);
+  
+  http.begin(url);
+  http.setTimeout(30000); // 30 second timeout
+  http.addHeader("Content-Type", "image/jpeg");
+  
+  // Send POST request with image data (cast to non-const)
+  int httpResponseCode = http.POST((uint8_t*)imageData, imageSize);
+   
+   String digit = "";
+   
+   if (httpResponseCode == 200) {
+     String response = http.getString();
+     Serial.println("OCR Server Response: " + response);
+     
+         // Parse JSON response
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, response);
+     
+     if (!error && doc["success"]) {
+       digit = doc["digit"].as<String>();
+       Serial.println("Digit extracted: " + digit);
+     } else {
+       Serial.println("OCR parsing failed or no digit found");
+       if (!error) {
+         Serial.println("Error from OCR: " + String((const char*)doc["error"]));
+       }
+     }
+   } else {
+     Serial.println("HTTP request to OCR server failed: " + String(httpResponseCode));
+     if (httpResponseCode > 0) {
+       String errorResponse = http.getString();
+       Serial.println("Error response: " + errorResponse);
+     }
+   }
+   
+   http.end();
+   return digit;
+ }
+ 
+ void handleStream() {
+   // Simple MJPEG stream
+   WiFiClient client = server.client();
+   
+   String response = "HTTP/1.1 200 OK\r\n";
+   response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+   server.sendContent(response);
+   
+   while (client.connected()) {
+     camera_fb_t * fb = esp_camera_fb_get();
+     if (!fb) {
+       Serial.println("Camera capture failed");
+       break;
+     }
+     
+     String frame = "--frame\r\n";
+     frame += "Content-Type: image/jpeg\r\n\r\n";
+     server.sendContent(frame);
+     
+     client.write(fb->buf, fb->len);
+     server.sendContent("\r\n");
+     
+     esp_camera_fb_return(fb);
+     
+     if (!client.connected()) {
+       break;
+     }
+     
+     delay(100);
+   }
+ }
