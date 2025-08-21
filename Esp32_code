@@ -1,21 +1,41 @@
+/*
+ * Unified Robot Code with Digit Game Integration
+ */
+
 #include <ESP32Servo.h>
 #include <Arduino.h>
 #include <BluetoothSerial.h>
 #include <FastLED.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
 #include "AudioTools.h"
 #include "BluetoothA2DPSink.h"
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
 
-// WiFi credentials - UPDATE THESE WITH YOUR NETWORK
+// WiFi credentials for digit game
 const char* ssid = "imf";
 const char* password = "7C4C7DF1";
 
-// ESP32-CAM IP address
-const char* esp32cam_ip = "192.168.8.151";
+// Network configuration for digit game
+const char* esp32_cam_ip = "192.168.8.151";  // ESP32-CAM IP
+const char* ocr_server_ip = "192.168.8.113";  // Python OCR server IP
+const int ocr_server_port = 8081;
+
+// HTTP server for receiving digit game results
+WebServer server(80);
+
+// Digit game variables
+bool digitGameEnabled = false;
+String previousDigit = "";
+String currentDigit = "";
+int digitCount = 0;
+unsigned long lastDetectionTime = 0;
+const unsigned long DETECTION_COOLDOWN = 3000; // 3 seconds between detections
+
+// HTTP client
+HTTPClient http;
 
 // ===== OLED Setup =====
 U8G2_SH1107_128X128_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
@@ -68,13 +88,8 @@ unsigned long startupStartTime = 0;
 #define COLOR_ORDER GRB
 CRGB leds[NUM_LEDS];
 
-// Additional LED pins for digit detection
-#define STATUS_LED 12
-#define SUCCESS_LED 13
-#define ERROR_LED 14
-
 // ===== Motor & Speed Control =====
-int motorSpeed = 75;
+int motorSpeed = 10;
 unsigned long lastPulse = 0;
 bool motorState = false;
 
@@ -83,7 +98,7 @@ void speedDigitalWrite(int pin, int state) {
   if (state == HIGH && motorSpeed < 100) {
     unsigned long now = millis();
     int onTime = motorSpeed;
-    int offTime = 100 - motorSpeed;
+    int offTime = 0;
     if (motorState) {
       if (now - lastPulse >= onTime) {
         digitalWrite_original(pin, LOW);
@@ -109,11 +124,11 @@ void speedDigitalWrite(int pin, int state) {
 #define LMB 5
 
 // IR sensor pins (Game Mode only)
-#define S1 25
-#define S2 33
+#define S1 34
+#define S2 35
 #define S3 32
-#define S4 35
-#define S5 34
+#define S4 33
+#define S5 25
 
 // Ultrasonic pins
 #define TRIG_PIN 27
@@ -123,7 +138,7 @@ void speedDigitalWrite(int pin, int state) {
 #define SERVO_GRIPPER1_PIN 2   // Game Mode obstacle handling
 #define SERVO_GRIPPER2_PIN 23  // Game Mode obstacle handling
 #define SERVO_LEFT_ARM_PIN 19
-#define SERVOE_RIGHT_ARM_PIN 18
+#define SERVO_RIGHT_ARM_PIN 18
 
 Servo gripperServo1;
 Servo gripperServo2;
@@ -145,26 +160,9 @@ Mode currentMode = GAME_MODE;
 String pendingCmd = "";
 
 // Game Mode specific variables
-enum GameRobotSubMode { LINE_FOLLOWING, MANUAL, DIGIT_DETECTION };
+enum GameRobotSubMode { LINE_FOLLOWING, MANUAL };
 GameRobotSubMode gameSubMode = LINE_FOLLOWING;
 bool firstObstacle = true;
-
-// Digit Detection variables
-enum DigitSystemState {
-  WAITING_FOR_FIRST_OBJECT,
-  PROCESSING_FIRST_DIGIT,
-  WAITING_FOR_SECOND_OBJECT,
-  PROCESSING_SECOND_DIGIT,
-  COMPARISON_COMPLETE
-};
-DigitSystemState digitState = WAITING_FOR_FIRST_OBJECT;
-String firstDigit = "";
-String secondDigit = "";
-bool comparisonResult = false;
-bool manualTriggerRequested = false;
-const float DETECTION_DISTANCE = 5.0; // 5cm detection threshold
-const int STABLE_READINGS = 3;        // Require 3 stable readings
-const int READING_DELAY = 100;        // Delay between readings (ms)
 
 // Play Mode specific variables
 bool turning = false;
@@ -189,6 +187,12 @@ MoveType currentMove = STOPPED_E;
 // Minion Colors for Entertainment Mode
 const CRGB minionYellow = CRGB(255, 255, 0);
 const CRGB minionBlue = CRGB(0, 0, 255);
+
+// Blink solid color without blocking movement
+unsigned long lastBlinkLED = 0;
+bool blinkStateLED = false;
+int blinkInterval = 250;
+CRGB manualBlinkColor = CRGB::Black;
 
 // Callback for Bluetooth audio connection changes
 void connection_state_changed(esp_a2d_connection_state_t state, void *ptr) {
@@ -217,7 +221,7 @@ void neutralArms() {
   rightArmServo.write(90);
 }
 
-// Common get distance
+// Common get distance (combined with timeout handling)
 float getDistance() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
@@ -227,201 +231,6 @@ float getDistance() {
   long duration = pulseIn(ECHO_PIN, HIGH, 30000);
   if (duration == 0) return -1;
   return duration * 0.034 / 2;
-}
-
-// Digit Detection: Detect object with stable readings
-bool detectObject() {
-  int stableCount = 0;
-  float lastDistance = 0;
-
-  for (int i = 0; i < STABLE_READINGS; i++) {
-    float distance = getDistance();
-    if (distance > 0 && distance <= DETECTION_DISTANCE) {
-      if (abs(distance - lastDistance) < 1.0) { // Within 1cm tolerance
-        stableCount++;
-      } else {
-        stableCount = 1; // Reset count if reading is not stable
-      }
-      lastDistance = distance;
-    } else {
-      return false; // Object not in range
-    }
-    delay(READING_DELAY);
-  }
-  return (stableCount >= STABLE_READINGS);
-}
-
-// Digit Detection: Capture and process digit from ESP32-CAM
-String captureAndProcessDigit() {
-  HTTPClient http;
-  String url = "http://" + String(esp32cam_ip) + "/capture_and_ocr";
-  Serial.println("🔄 Requesting FRESH digit capture from ESP32-CAM...");
-  Serial.println("⏱ ESP32-CAM will clear buffer before capture to prevent old images");
-  http.begin(url);
-  http.setTimeout(35000); // Increased timeout for buffer clearing
-  int httpResponseCode = http.GET();
-  String response = "";
-  if (httpResponseCode == 200) {
-    response = http.getString();
-    Serial.println("ESP32-CAM Response: " + response);
-    JsonDocument doc;
-    deserializeJson(doc, response);
-    if (doc["success"]) {
-      String digit = doc["digit"];
-      Serial.println("Digit successfully captured: " + digit);
-      http.end();
-      return digit;
-    } else {
-      Serial.println("ESP32-CAM failed to capture digit: " + String((const char*)doc["error"]));
-    }
-  } else {
-    Serial.println("HTTP request failed: " + String(httpResponseCode));
-    if (httpResponseCode > 0) {
-      response = http.getString();
-      Serial.println("Error response: " + response);
-    }
-  }
-  http.end();
-  return "";
-}
-
-// Digit Detection: Compare digits
-void compareDigits() {
-  comparisonResult = (firstDigit == secondDigit);
-  Serial.println("=== DIGIT COMPARISON RESULT ===");
-  Serial.println("First digit:  " + firstDigit);
-  Serial.println("Second digit: " + secondDigit);
-  Serial.println("Match: " + String(comparisonResult ? "TRUE" : "FALSE"));
-  Serial.println("===============================");
-  SerialBT.println("Digit Comparison: " + firstDigit + " vs " + secondDigit + " -> " + (comparisonResult ? "Match" : "No Match"));
-  if (comparisonResult) {
-    for (int i = 0; i < 5; i++) {
-      digitalWrite(SUCCESS_LED, HIGH);
-      delay(200);
-      digitalWrite(SUCCESS_LED, LOW);
-      delay(200);
-    }
-    digitalWrite(SUCCESS_LED, HIGH);
-  } else {
-    for (int i = 0; i < 5; i++) {
-      digitalWrite(ERROR_LED, HIGH);
-      delay(300);
-      digitalWrite(ERROR_LED, LOW);
-      delay(300);
-    }
-  }
-}
-
-// Digit Detection: Reset system
-void resetDigitSystem() {
-  Serial.println("Resetting digit detection system...");
-  digitState = WAITING_FOR_FIRST_OBJECT;
-  firstDigit = "";
-  secondDigit = "";
-  comparisonResult = false;
-  digitalWrite(SUCCESS_LED, LOW);
-  digitalWrite(ERROR_LED, LOW);
-  digitalWrite(STATUS_LED, HIGH);
-  Serial.println("System ready for next digit detection!");
-  SerialBT.println("Digit detection system reset");
-}
-
-// Digit Detection: Blink LED
-void blinkLED(int pin, int times) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(pin, HIGH);
-    delay(200);
-    digitalWrite(pin, LOW);
-    delay(200);
-  }
-}
-
-// Digit Detection: Handle serial commands for testing
-void handleSerialCommands() {
-  if (Serial.available()) {
-    String command = Serial.readString();
-    command.trim();
-    command.toLowerCase();
-    if (command == "trigger" || command == "t") {
-      manualTriggerRequested = true;
-      Serial.println("\n🎯 MANUAL TRIGGER ACTIVATED!");
-      SerialBT.println("Manual trigger activated");
-      Serial.println("State: " + String(digitState));
-      if (digitState == WAITING_FOR_FIRST_OBJECT) {
-        Serial.println("→ Will simulate first object detection");
-      } else if (digitState == WAITING_FOR_SECOND_OBJECT) {
-        Serial.println("→ Will simulate second object detection");
-      } else {
-        Serial.println("→ System not waiting for objects");
-        manualTriggerRequested = false;
-      }
-    } else if (command == "status" || command == "s") {
-      Serial.println("\n📊 === DIGIT DETECTION STATUS ===");
-      Serial.println("Current State: " + getDigitStateString(digitState));
-      Serial.println("First Digit: " + (firstDigit != "" ? firstDigit : "Not captured"));
-      Serial.println("Second Digit: " + (secondDigit != "" ? secondDigit : "Not captured"));
-      Serial.println("ESP32-CAM IP: " + String(esp32cam_ip));
-      Serial.println("WiFi Status: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("ESP32 IP: " + WiFi.localIP().toString());
-      }
-      Serial.println("Detection Distance: " + String(DETECTION_DISTANCE) + "cm");
-      Serial.println("📊 === END STATUS ===\n");
-      SerialBT.println("Digit Detection Status: " + getDigitStateString(digitState));
-    } else if (command == "reset" || command == "r") {
-      Serial.println("\n🔄 MANUAL DIGIT SYSTEM RESET");
-      SerialBT.println("Manual digit system reset");
-      resetDigitSystem();
-    } else if (command == "test" || command == "distance") {
-      Serial.println("\n📏 === DISTANCE TEST ===");
-      for (int i = 0; i < 5; i++) {
-        float dist = getDistance();
-        Serial.println("Reading " + String(i+1) + ": " + String(dist) + " cm");
-        delay(500);
-      }
-      Serial.println("📏 === TEST COMPLETE ===\n");
-      SerialBT.println("Distance test completed");
-    } else if (command == "clear" || command == "c") {
-      Serial.println("\n🧹 MANUAL CAMERA BUFFER CLEAR");
-      SerialBT.println("Manual camera buffer clear");
-      Serial.println("Requesting ESP32-CAM to clear buffer...");
-      HTTPClient http;
-      String url = "http://" + String(esp32cam_ip) + "/capture";
-      http.begin(url);
-      http.setTimeout(10000);
-      int code = http.GET();
-      http.end();
-      Serial.println("Buffer clear request sent: " + String(code));
-      Serial.println("🧹 === CLEAR COMPLETE ===\n");
-      SerialBT.println("Camera buffer cleared");
-    } else if (command == "help" || command == "h") {
-      Serial.println("\n🎮 === DIGIT DETECTION TESTING COMMANDS ===");
-      Serial.println("'trigger' or 't' - Manually trigger object detection");
-      Serial.println("'status' or 's'  - Show current digit detection status");
-      Serial.println("'reset' or 'r'   - Reset digit detection system");
-      Serial.println("'test'           - Test ultrasonic sensor readings");
-      Serial.println("'clear' or 'c'   - Manually clear camera buffer");
-      Serial.println("'help' or 'h'    - Show this help menu");
-      Serial.println("🎮 === COMMANDS READY ===\n");
-      SerialBT.println("Digit detection testing commands listed");
-    } else if (command != "") {
-      Serial.println("❌ Unknown command: '" + command + "'");
-      Serial.println("Type 'help' for available commands");
-      SerialBT.println("Unknown digit detection command");
-    }
-  }
-}
-
-// Digit Detection: Get state string
-String getDigitStateString(DigitSystemState state) {
-  switch (state) {
-    case WAITING_FOR_FIRST_OBJECT: return "WAITING_FOR_FIRST_OBJECT";
-    case PROCESSING_FIRST_DIGIT: return "PROCESSING_FIRST_DIGIT";
-    case WAITING_FOR_SECOND_OBJECT: return "WAITING_FOR_SECOND_OBJECT";
-    case PROCESSING_SECOND_DIGIT: return "PROCESSING_SECOND_DIGIT";
-    case COMPARISON_COMPLETE: return "COMPARISON_COMPLETE";
-    default: return "UNKNOWN";
-  }
 }
 
 // ===== OLED Draw Eye (Parameterized for inversion) =====
@@ -450,10 +259,11 @@ void drawEye(bool inverted, float x, float y, float eyeHeightRatio) {
 
 // ===== Entertainment Mode OLED Drawing Functions =====
 void drawCircle(float x, float y) {
-  u8g2.drawDisc((int)x, (int)y, 30, U8G2_DRAW_ALL);
+  u8g2.drawDisc((int)x, (int)y, 30, U8G2_DRAW_ALL); // Larger radius
 }
 
 void drawHeart(float x, float y) {
+  // Scaled heart (~60x60 pixels)
   u8g2.drawCircle((int)x - 15, (int)y - 15, 15, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
   u8g2.drawCircle((int)x + 15, (int)y - 15, 15, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
   u8g2.drawLine((int)x - 30, (int)y - 15, (int)x, (int)y + 30);
@@ -461,6 +271,7 @@ void drawHeart(float x, float y) {
 }
 
 void drawTriangle(float x, float y) {
+  // Larger equilateral triangle (~60x60 pixels)
   int x1 = (int)x;
   int y1 = (int)y - 30;
   int x2 = (int)x - 30;
@@ -472,7 +283,7 @@ void drawTriangle(float x, float y) {
 
 void drawShape() {
   if (!shapeVisible) return;
-  u8g2.setDrawColor(1);
+  u8g2.setDrawColor(1); // White shape
   switch (currentShape) {
     case CIRCLE: drawCircle(shapeX, shapeY); break;
     case HEART: drawHeart(shapeX, shapeY); break;
@@ -485,61 +296,69 @@ void updateOLED() {
   u8g2.clearBuffer();
 
   if (currentMode == ENTERTAINMENT_MODE) {
+    // Entertainment Mode OLED
     u8g2.setDrawColor(0);
-    u8g2.drawBox(0, 0, screenWidth, screenHeight);
+    u8g2.drawBox(0, 0, screenWidth, screenHeight); // Black background
+
     if (startupAnimation) {
+      // Animate "Let's Dance" from right to left
       u8g2.setFont(u8g2_font_fub20_tf);
-      u8g2.setDrawColor(1);
+      u8g2.setDrawColor(1); // White text
       const char* text = "Let's Dance";
       u8g2.drawStr((int)textX, centerY + 10, text);
       textX -= textSpeed;
       if (textX < -100) {
-        startupAnimation = false;
-        shapeX = centerX;
+        startupAnimation = false; // End animation
+        shapeX = centerX; // Reset shape position
         shapeY = centerY;
       }
       u8g2.sendBuffer();
       return;
     }
 
+    // Switch shapes every 5 seconds
     if (millis() - lastShapeSwitch >= SHAPE_SWITCH_INTERVAL) {
-      currentShape = (ShapeType)((currentShape + 1) % 3);
+      currentShape = (ShapeType)((currentShape + 1) % 3); // Cycle: CIRCLE -> HEART -> TRIANGLE
       lastShapeSwitch = millis();
     }
 
+    // Update shape position
     float targetX = shapeX;
     float targetY = shapeY;
     bool isMoving = false;
     if (currentMove == STOPPED_E) {
       if (millis() - lastIdleMove >= 1000) {
         lastIdleMove = millis();
-        idleDirection = random(4);
+        idleDirection = random(4); // 0: left, 1: right, 2: up, 3: down
       }
       switch (idleDirection) {
-        case 0: targetX -= 2.0; isMoving = true; break;
-        case 1: targetX += 2.0; isMoving = true; break;
-        case 2: targetY -= 2.0; isMoving = true; break;
-        case 3: targetY += 2.0; isMoving = true; break;
+        case 0: targetX -= 2.0; isMoving = true; break; // Left
+        case 1: targetX += 2.0; isMoving = true; break; // Right
+        case 2: targetY -= 2.0; isMoving = true; break; // Up
+        case 3: targetY += 2.0; isMoving = true; break; // Down
       }
     } else {
       switch (currentMove) {
-        case FORWARD_E: targetY -= 2.0; isMoving = true; break;
-        case BACKWARD_E: targetY += 2.0; isMoving = true; break;
-        case TURN_LEFT_E: targetX -= 2.0; isMoving = true; break;
-        case TURN_RIGHT_E: targetX += 2.0; isMoving = true; break;
-        case SPIN_E: targetX += 2.0; isMoving = true; break;
+        case FORWARD_E: targetY -= 2.0; isMoving = true; break; // Up
+        case BACKWARD_E: targetY += 2.0; isMoving = true; break; // Down
+        case TURN_LEFT_E: targetX -= 2.0; isMoving = true; break; // Left
+        case TURN_RIGHT_E: targetX += 2.0; isMoving = true; break; // Right
+        case SPIN_E: targetX += 2.0; isMoving = true; break; // Right
         default: break;
       }
     }
 
+    // Smooth movement
     if (abs(targetX - shapeX) > 2.0) shapeX += (targetX > shapeX) ? 2.0 : -2.0;
     else shapeX = targetX;
     if (abs(targetY - shapeY) > 2.0) shapeY += (targetY > shapeY) ? 2.0 : -2.0;
     else shapeY = targetY;
 
+    // Constrain position for larger shapes
     shapeX = constrain(shapeX, 40, screenWidth - 40);
     shapeY = constrain(shapeY, 40, screenHeight - 40);
 
+    // Update text display
     if (isMoving) {
       lastMoveTime = millis();
       showText = false;
@@ -547,13 +366,15 @@ void updateOLED() {
       showText = true;
     }
 
+    // Draw content
     if (showText) {
-      u8g2.setFont(u8g2_font_fub20_tf);
-      u8g2.setDrawColor(1);
+      u8g2.setFont(u8g2_font_fub20_tf); // Larger font
+      u8g2.setDrawColor(1); // White text
       const char* text = "Let's Dance";
       int textWidth = u8g2.getStrWidth(text);
-      u8g2.drawStr((screenWidth - textWidth) / 2, centerY + 10, text);
+      u8g2.drawStr((screenWidth - textWidth) / 2, centerY + 10, text); // Centered
     } else {
+      // Blink shape
       if (shapeVisible && millis() - lastBlink >= BLINK_ON) {
         shapeVisible = false;
         lastBlink = millis();
@@ -564,8 +385,10 @@ void updateOLED() {
       drawShape();
     }
   } else {
+    // Game/Play Mode OLED (existing eye behavior)
     int targetX = centerX;
     int targetY = centerY;
+
     int openBlinkThreshold = (currentMode == GAME_MODE) ? 500 : 400;
     float verticalOffset = (currentMode == GAME_MODE) ? 40 : 50;
 
@@ -576,6 +399,7 @@ void updateOLED() {
         idleDirection++;
         if (idleDirection > 8) idleDirection = 0;
       }
+
       if (idleDirection == 1) targetX = centerX - 25;
       else if (idleDirection == 3) targetX = centerX + 25;
       else if (idleDirection == 5) targetY = centerY - verticalOffset;
@@ -628,6 +452,7 @@ void updateOLED() {
 
     drawEye(currentMode == PLAY_MODE, currentX, currentY, eyeHeightRatio);
   }
+  
   u8g2.sendBuffer();
 }
 
@@ -665,70 +490,80 @@ void sequenceColorsLoadingGame() {
   }
 }
 
+// Blink solid color without blocking movement
+void updateManualBlink() {
+  if (manualBlinkColor != CRGB::Black) {
+    unsigned long now = millis();
+    if (now - lastBlinkLED > blinkInterval) {
+      lastBlinkLED = now;
+      blinkStateLED = !blinkStateLED;
+      if (blinkStateLED)
+        fill_solid(leds, NUM_LEDS, manualBlinkColor);
+      else
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+      FastLED.show();
+    }
+  }
+}
+
 // ===== Game Mode Arm Update =====
-void updateArmsGame(RobotState state) {
-  switch(state) {
-    case FORWARD:
-      leftArmServo.write(135);
-      rightArmServo.write(45);
-      break;
-    case BACKWARD:
-      leftArmServo.write(45);
-      rightArmServo.write(135);
-      break;
-    case LEFT:
-      leftArmServo.write(90);
-      rightArmServo.write(45);
-      break;
-    case RIGHT:
-      leftArmServo.write(135);
-      rightArmServo.write(90);
-      break;
-    case STOP:
-    default:
-      leftArmServo.write(90);
-      rightArmServo.write(90);
-      break;
+void updateHands() {
+  if (currentRobotState == FORWARD || currentRobotState == BACKWARD ||
+      currentRobotState == LEFT || currentRobotState == RIGHT) {
+    unsigned long now = millis();
+    float angleAmplitude = 60; // max swing
+    float speed = 0.004;       // swing speed
+    float angle = angleAmplitude * sin(now * speed);
+    leftArmServo.write(90 + angle);
+    rightArmServo.write(90 - angle);
+  } else {
+    leftArmServo.write(90);
+    rightArmServo.write(90);
   }
 }
 
 // ===== Game Mode Movement Functions =====
-void goForwardGame() {
-  currentRobotState = FORWARD;
-  digitalWrite(RMF, HIGH); digitalWrite(RMB, LOW);
-  digitalWrite(LMF, HIGH); digitalWrite(LMB, LOW);
-  showYellowBlueGame();
-  updateArmsGame(FORWARD);
+void goForwardGame() { 
+  currentRobotState = FORWARD; 
+  digitalWrite(RMF, HIGH); digitalWrite(RMB, LOW); 
+  digitalWrite(LMF, HIGH); digitalWrite(LMB, LOW); 
+  showYellowBlueGame(); 
+  manualBlinkColor = CRGB::Black;
 }
 
-void goBackwardGame() {
-  currentRobotState = BACKWARD;
-  digitalWrite(RMF, LOW); digitalWrite(RMB, HIGH);
-  digitalWrite(LMF, LOW); digitalWrite(LMB, HIGH);
-  showYellowBlueGame();
-  updateArmsGame(BACKWARD);
+void goBackwardGame() { 
+  currentRobotState = BACKWARD; 
+  digitalWrite(RMF, LOW); digitalWrite(RMB, HIGH); 
+  digitalWrite(LMF, LOW); digitalWrite(LMB, HIGH); 
+  showYellowBlueGame(); 
+  delay(150); 
+  clearLEDs(); 
+  delay(150); 
+  manualBlinkColor = CRGB::Black;
 }
 
-void turnLeftGame() {
-  currentRobotState = LEFT;
-  digitalWrite(RMF, HIGH); digitalWrite(RMB, LOW);
-  digitalWrite(LMF, LOW); digitalWrite(LMB, HIGH);
-  showYellowBlueGame();
-  updateArmsGame(LEFT);
+void turnLeftGame() { 
+  currentRobotState = LEFT; 
+  digitalWrite(RMF, HIGH); digitalWrite(RMB, LOW); 
+  digitalWrite(LMF, LOW); digitalWrite(LMB, HIGH); 
+  if (gameSubMode == MANUAL) manualBlinkColor = CRGB::Yellow;
+  else { showYellowBlueGame(); manualBlinkColor = CRGB::Black; }
 }
 
-void turnRightGame() {
-  currentRobotState = RIGHT;
-  digitalWrite(RMF, LOW); digitalWrite(RMB, HIGH);
-  digitalWrite(LMF, HIGH); digitalWrite(LMB, LOW);
-  showYellowBlueGame();
-  updateArmsGame(RIGHT);
+void turnRightGame() { 
+  currentRobotState = RIGHT; 
+  digitalWrite(RMF, LOW); digitalWrite(RMB, HIGH); 
+  digitalWrite(LMF, HIGH); digitalWrite(LMB, LOW); 
+  if (gameSubMode == MANUAL) manualBlinkColor = CRGB::Red;
+  else { showYellowBlueGame(); manualBlinkColor = CRGB::Black; }
 }
 
-void stopNowGame() {
-  stopMotors();
-  showFiveColorsGame();
-  updateArmsGame(STOP);
+void stopNowGame() { 
+  stopMotors(); 
+  showFiveColorsGame(); 
+  leftArmServo.write(90); 
+  rightArmServo.write(90); 
+  manualBlinkColor = CRGB::Black;
 }
 
 // ===== Play Mode LED Effects =====
@@ -772,13 +607,16 @@ void turnEffectPlay() {
 // ===== Play Mode Arm Waving =====
 void waveHandsPlay() {
   if (!waving) return;
+
   unsigned long currentTime = millis();
-  if (currentTime - lastWaveTime >= 5) {
+  if (currentTime - lastWaveTime >= 5) {  // Faster updates
     lastWaveTime = currentTime;
+
     servoPos += increment;
     if (servoPos >= 120 || servoPos <= 60) {
       increment = -increment;
     }
+
     leftArmServo.write(servoPos);
     rightArmServo.write(servoPos);
   }
@@ -832,6 +670,8 @@ void stopMotorsPlay() {
 }
 
 // ===== Entertainment Mode Functions =====
+
+// Entertainment Mode Motor Movements
 void moveForwardEntertain() {
   digitalWrite(RMF, HIGH);
   digitalWrite(RMB, LOW);
@@ -881,6 +721,7 @@ void spinAroundEntertain() {
   delay(800);
 }
 
+// Entertainment Mode Servo Actions
 void waveHandsUpDown() {
   leftArmServo.write(45);
   rightArmServo.write(135);
@@ -908,11 +749,14 @@ void waveHandsTogether() {
   delay(300);
 }
 
+// Entertainment Mode LED Animation
 void updateLEDPattern() {
-  if (millis() - lastLEDUpdate < 100) return;
+  if (millis() - lastLEDUpdate < 100) return; // 100ms update
   lastLEDUpdate = millis();
+
   static int offset = 0;
   offset++;
+
   switch (currentMove) {
     case FORWARD_E:
     case BACKWARD_E:
@@ -920,26 +764,33 @@ void updateLEDPattern() {
         leds[(i + offset) % NUM_LEDS] = (i % 2 == 0) ? minionYellow : minionBlue;
       }
       break;
+
     case TURN_LEFT_E:
       for (int i = 0; i < NUM_LEDS; i++) {
         leds[(i + offset) % NUM_LEDS] = (i % 2 == 0) ? minionBlue : minionYellow;
       }
       break;
+
     case TURN_RIGHT_E:
     case SPIN_E:
       for (int i = 0; i < NUM_LEDS; i++) {
         leds[(i - offset + NUM_LEDS) % NUM_LEDS] = (i % 2 == 0) ? minionYellow : minionBlue;
       }
       break;
+
     default:
       break;
   }
+
   FastLED.show();
 }
 
+// Entertainment Mode Servo Motion when Motors Run
 void updateServoMotion() {
-  if (millis() - lastServoUpdate < 100) return;
+  if (millis() - lastServoUpdate < 100) return; // 100ms per update
   lastServoUpdate = millis();
+
+  // Move in opposite directions
   if (servoDirection) {
     leftAngle += 5;
     rightAngle -= 5;
@@ -947,21 +798,26 @@ void updateServoMotion() {
     leftAngle -= 5;
     rightAngle += 5;
   }
+
   if (leftAngle >= 135 || leftAngle <= 45) {
-    servoDirection = !servoDirection;
+    servoDirection = !servoDirection; // reverse direction
   }
+
   leftArmServo.write(leftAngle);
   rightArmServo.write(rightAngle);
 }
 
+// Entertainment Mode Dance Routines
 void danceRoutine1() {
   static unsigned long lastStepTime = 0;
   static int step = 0;
   unsigned long interval = 1500;
+
   if (millis() - lastStepTime >= interval) {
     lastStepTime = millis();
     step++;
     if (step > 8) step = 1;
+
     switch (step) {
       case 1: moveForwardEntertain(); break;
       case 2: moveBackwardEntertain(); break;
@@ -979,10 +835,12 @@ void danceRoutine2() {
   static unsigned long lastStepTime = 0;
   static int step = 0;
   unsigned long interval = 1200;
+
   if (millis() - lastStepTime >= interval) {
     lastStepTime = millis();
     step++;
     if (step > 8) step = 1;
+
     switch (step) {
       case 1: moveForwardEntertain(); break;
       case 2: moveBackwardEntertain(); break;
@@ -998,38 +856,38 @@ void danceRoutine2() {
 
 // ===== Mode Switching Functions =====
 void switchToGameMode() {
+  // Cleanup
   stopMotors();
   clearLEDs();
   neutralArms();
   gripperServo1.write(0);
   gripperServo2.write(0);
+
+  // Initialize Game Mode
   currentMode = GAME_MODE;
   gameSubMode = LINE_FOLLOWING;
   firstObstacle = true;
-  digitState = WAITING_FOR_FIRST_OBJECT;
-  firstDigit = "";
-  secondDigit = "";
-  comparisonResult = false;
-  motorSpeed = 75;
+  motorSpeed = 10;
   blinkState = OPEN;
   blinkTimer = 0;
   currentX = centerX;
   currentY = centerY;
   currentRobotState = STOP;
   turning = false;
-  digitalWrite(STATUS_LED, HIGH);
-  digitalWrite(SUCCESS_LED, LOW);
-  digitalWrite(ERROR_LED, LOW);
+  manualBlinkColor = CRGB::Black;
   Serial.println("Switched to Game Mode");
   SerialBT.println("Game Mode Activated");
 }
 
 void switchToPlayMode() {
+  // Cleanup
   stopMotors();
   clearLEDs();
   neutralArms();
   gripperServo1.write(0);
   gripperServo2.write(0);
+
+  // Initialize Play Mode
   currentMode = PLAY_MODE;
   turning = false;
   waving = false;
@@ -1043,20 +901,21 @@ void switchToPlayMode() {
   currentX = centerX;
   currentY = centerY;
   currentRobotState = STOP;
-  motorSpeed = 100;
-  digitalWrite(STATUS_LED, LOW);
-  digitalWrite(SUCCESS_LED, LOW);
-  digitalWrite(ERROR_LED, LOW);
+  motorSpeed = 60;  // Full speed for Play Mode
   Serial.println("Switched to Play Mode");
   SerialBT.println("Play Mode Activated");
+  Serial.println("Play Mode: Confirming currentMode = PLAY_MODE");
 }
 
 void switchToEntertainmentMode() {
+  // Cleanup
   stopMotors();
   clearLEDs();
   neutralArms();
   gripperServo1.write(0);
   gripperServo2.write(0);
+
+  // Initialize Entertainment Mode
   currentMode = ENTERTAINMENT_MODE;
   danceMode = 1;
   danceStartTime = millis();
@@ -1066,7 +925,9 @@ void switchToEntertainmentMode() {
   rightAngle = 120;
   servoDirection = true;
   currentMove = STOPPED_E;
-  motorSpeed = 100;
+  motorSpeed = 100;  // Full speed for Entertainment Mode
+  
+  // Reset OLED animation variables
   startupAnimation = true;
   textX = screenWidth + 100;
   shapeX = centerX;
@@ -1079,112 +940,231 @@ void switchToEntertainmentMode() {
   lastMoveTime = millis();
   idleDirection = 0;
   lastIdleMove = millis();
-  digitalWrite(STATUS_LED, LOW);
-  digitalWrite(SUCCESS_LED, LOW);
-  digitalWrite(ERROR_LED, LOW);
+  
   Serial.println("Switched to Entertainment Mode");
   SerialBT.println("Entertainment Mode Activated - Let's Dance!");
+}
+
+// ===== Digit Game Functions =====
+void enableDigitGame() {
+  digitGameEnabled = true;
+  digitCount = 0;
+  previousDigit = "";
+  currentDigit = "";
+  Serial.println("🎮 Digit Game Enabled!");
+  SerialBT.println("Digit Game Enabled");
+}
+
+void disableDigitGame() {
+  digitGameEnabled = false;
+  Serial.println("🎮 Digit Game Disabled!");
+  SerialBT.println("Digit Game Disabled");
+}
+
+void executeDigitGame() {
+  // Check ultrasonic sensor for object detection
+  float distance = getDistance();
+  
+  // Object detected within 15cm
+  if (distance > 0 && distance <= 15) {
+    unsigned long currentTime = millis();
+    
+    // Cooldown to prevent multiple detections
+    if (currentTime - lastDetectionTime > DETECTION_COOLDOWN) {
+      lastDetectionTime = currentTime;
+      Serial.printf("📸 Object detected at %.2f cm - Starting digit capture\n", distance);
+      
+      // Capture and process digit
+      captureAndProcessDigit();
+    }
+  }
+}
+
+void captureAndProcessDigit() {
+  Serial.println("📷 Capturing image from ESP32-CAM...");
+  
+  // Step 1: Capture image from ESP32-CAM
+  String imageUrl = "http://" + String(esp32_cam_ip) + "/capture";
+  
+  http.begin(imageUrl);
+  http.setTimeout(30000);
+  
+  int httpResponseCode = http.GET();
+  if (httpResponseCode == 200) {
+    Serial.println("✅ Image captured successfully");
+    
+    // Step 2: Send image to OCR server
+    processImageWithOCR(http.getStream());
+    
+  } else {
+    Serial.printf("❌ Failed to capture image: %d\n", httpResponseCode);
+    SerialBT.println("Failed to capture image");
+  }
+  
+  http.end();
+}
+
+void processImageWithOCR(Stream& imageStream) {
+  Serial.println("🤖 Processing image with OCR...");
+  
+  String ocrUrl = "http://" + String(ocr_server_ip) + ":" + String(ocr_server_port) + "/process_image";
+  
+  HTTPClient ocrHttp;
+  ocrHttp.begin(ocrUrl);
+  ocrHttp.setTimeout(30000);
+  ocrHttp.addHeader("Content-Type", "image/jpeg");
+  
+  // Read image data from stream and send to OCR server
+  int httpResponseCode = ocrHttp.POST(imageStream);
+  
+  if (httpResponseCode == 200) {
+    String response = ocrHttp.getString();
+    Serial.println("OCR Response: " + response);
+    
+    // Parse JSON response
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, response);
+    
+    if (!error && doc["success"]) {
+      String digit = doc["digit"].as<String>();
+      Serial.printf("🎯 Digit detected: %s\n", digit.c_str());
+      
+      // Process digit game logic
+      processDigitResult(digit);
+      
+    } else {
+      Serial.println("❌ OCR failed or no digit detected");
+      SerialBT.println("OCR failed - no digit detected");
+    }
+    
+  } else {
+    Serial.printf("❌ OCR request failed: %d\n", httpResponseCode);
+    SerialBT.println("OCR request failed");
+  }
+  
+  ocrHttp.end();
+}
+
+void processDigitResult(String digit) {
+  digitCount++;
+  
+  if (digitCount == 1) {
+    // First digit
+    previousDigit = digit;
+    currentDigit = digit;
+    Serial.printf("🎯 First digit captured: %s\n", digit.c_str());
+    SerialBT.printf("First digit: %s", digit.c_str());
+    
+    // Display on OLED or LED if needed
+    // For example:
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_fub20_tf);
+    u8g2.drawStr(10, 64, digit.c_str());
+    u8g2.sendBuffer();
+    
+  } else if (digitCount == 2) {
+    // Second digit
+    currentDigit = digit;
+    Serial.printf("🎯 Second digit captured: %s\n", digit.c_str());
+    SerialBT.printf("Second digit: %s", digit.c_str());
+    
+    // Compare digits
+    if (previousDigit == currentDigit) {
+      Serial.println("🎉 SUCCESS: Digits match!");
+      SerialBT.println("SUCCESS: Digits match!");
+      // Green LED or something
+      fill_solid(leds, NUM_LEDS, CRGB::Green);
+      FastLED.show();
+    } else {
+      Serial.printf("❌ FAIL: Digits don't match (%s vs %s)\n", previousDigit.c_str(), currentDigit.c_str());
+      SerialBT.printf("FAIL: Digits don't match (%s vs %s)", previousDigit.c_str(), currentDigit.c_str());
+      // Red LED
+      fill_solid(leds, NUM_LEDS, CRGB::Red);
+      FastLED.show();
+    }
+    
+    // Reset for next game
+    digitCount = 0;
+    previousDigit = "";
+    currentDigit = "";
+    delay(2000); // Show result for 2 seconds
+    clearLEDs();
+    
+  } else {
+    Serial.println("⚠️ Unexpected digit count, resetting");
+    digitCount = 1;
+    previousDigit = digit;
+    currentDigit = digit;
+  }
+}
+
+// HTTP server to receive commands (if needed from other ESP32)
+void handleDigitGameCommand() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    Serial.printf("Received HTTP command: %s\n", body.c_str());
+    
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, body);
+    
+    if (!error && doc.containsKey("command")) {
+      String command = doc["command"].as<String>();
+      
+      if (command == "DIGIT_ON") {
+        enableDigitGame();
+        server.send(200, "application/json", "{\"status\":\"enabled\"}");
+      } else if (command == "DIGIT_OFF") {
+        disableDigitGame();
+        server.send(200, "application/json", "{\"status\":\"disabled\"}");
+      } else {
+        server.send(400, "application/json", "{\"error\":\"unknown_command\"}");
+      }
+    } else {
+      server.send(400, "application/json", "{\"error\":\"invalid_json\"}");
+    }
+  } else {
+    server.send(400, "application/json", "{\"error\":\"no_body\"}");
+  }
 }
 
 // ===== Execute Game Mode =====
 void executeGameMode() {
   float distance = getDistance();
 
-  // Ultrasonic sensor obstacle handling (10 cm)
-  if (!turning && distance > 0 && distance <= 10 && distance > DETECTION_DISTANCE && currentRobotState != STOP) {
+  // Ultrasonic sensor obstacle handling
+  if (firstObstacle && distance > 0 && distance <= 6) {
     stopNowGame();
-    SerialBT.println("Obstacle detected in Game Mode at 10cm!");
-    turnRightGame();
-    turning = true;
-    turnStartTime = millis();
-  }
-  if (turning && millis() - turnStartTime >= 100) {
-    stopNowGame();
-    turning = false;
-  }
-
-  // Digit detection for close proximity (≤ 5 cm)
-  if (distance > 0 && distance <= DETECTION_DISTANCE) {
-    stopNowGame();
-    SerialBT.println("Close obstacle detected at 5cm! Initiating digit detection...");
-    gameSubMode = DIGIT_DETECTION;
-  }
-
-  if (gameSubMode == DIGIT_DETECTION) {
-    handleSerialCommands();
-    switch (digitState) {
-      case WAITING_FOR_FIRST_OBJECT:
-        if (detectObject() || manualTriggerRequested) {
-          if (manualTriggerRequested) {
-            Serial.println("MANUAL TRIGGER: First object simulation! Capturing and processing...");
-            SerialBT.println("Manual trigger: First object simulation");
-            manualTriggerRequested = false;
-          } else {
-            Serial.println("First object detected! Capturing and processing...");
-            SerialBT.println("First object detected");
-          }
-          digitState = PROCESSING_FIRST_DIGIT;
-          blinkLED(SUCCESS_LED, 2);
-        }
-        break;
-      case PROCESSING_FIRST_DIGIT:
-        firstDigit = captureAndProcessDigit();
-        if (firstDigit != "") {
-          Serial.println("First digit captured: " + firstDigit);
-          SerialBT.println("First digit: " + firstDigit);
-          Serial.println("Drive to second signpost...");
-          digitState = WAITING_FOR_SECOND_OBJECT;
-          blinkLED(SUCCESS_LED, 3);
-          delay(2000);
-        } else {
-          Serial.println("Failed to capture first digit. Retrying...");
-          SerialBT.println("Failed to capture first digit");
-          digitState = WAITING_FOR_FIRST_OBJECT;
-          blinkLED(ERROR_LED, 2);
-          delay(1000);
-        }
-        break;
-      case WAITING_FOR_SECOND_OBJECT:
-        if (detectObject() || manualTriggerRequested) {
-          if (manualTriggerRequested) {
-            Serial.println("MANUAL TRIGGER: Second object simulation! Capturing and processing...");
-            SerialBT.println("Manual trigger: Second object simulation");
-            manualTriggerRequested = false;
-          } else {
-            Serial.println("Second object detected! Capturing and processing...");
-            SerialBT.println("Second object detected");
-          }
-          digitState = PROCESSING_SECOND_DIGIT;
-          blinkLED(SUCCESS_LED, 2);
-        }
-        break;
-      case PROCESSING_SECOND_DIGIT:
-        secondDigit = captureAndProcessDigit();
-        if (secondDigit != "") {
-          Serial.println("Second digit captured: " + secondDigit);
-          SerialBT.println("Second digit: " + secondDigit);
-          digitState = COMPARISON_COMPLETE;
-        } else {
-          Serial.println("Failed to capture second digit. Retrying...");
-          SerialBT.println("Failed to capture second digit");
-          digitState = WAITING_FOR_SECOND_OBJECT;
-          blinkLED(ERROR_LED, 2);
-          delay(1000);
-        }
-        break;
-      case COMPARISON_COMPLETE:
-        compareDigits();
-        delay(5000);
-        resetDigitSystem();
-        gameSubMode = LINE_FOLLOWING;
-        firstObstacle = true;
-        SerialBT.println("Returning to LINE FOLLOWING mode");
-        break;
-    }
+    SerialBT.println("First obstacle detected (<=6cm)!");
+    delay(500);
+    loadingPatternGame(CRGB::Red, 2);
+    gripperServo2.write(40); delay(500);
+    gripperServo1.write(180); delay(500);
+    firstObstacle = false;
     updateOLED();
+    // Trigger digit game on obstacle detection
+    executeDigitGame();
+    return;
+  }
+  else if (!firstObstacle && distance > 0 && distance <= 14) {
+    stopNowGame();
+    SerialBT.println("Second obstacle detected (<=14cm)!");
+    delay(500);
+    sequenceColorsLoadingGame();
+    gripperServo1.write(0); delay(500);
+    gripperServo2.write(0); delay(500);
+    turnRightGame(); delay(1000);
+    goBackwardGame(); delay(650);
+    turnLeftGame(); delay(1000);
+    turnRightGame(); delay(1450);
+    stopNowGame();
+    firstObstacle = true;
+    updateOLED();
+    // Trigger digit game on second obstacle
+    executeDigitGame();
     return;
   }
 
+  // Line following and manual movement
   int s1 = digitalRead(S1);
   int s2 = digitalRead(S2);
   int s3 = digitalRead(S3);
@@ -1193,8 +1173,11 @@ void executeGameMode() {
 
   if (gameSubMode == LINE_FOLLOWING) {
     if (s1 == LOW && s2 == LOW && s3 == LOW && s4 == LOW && s5 == LOW) {
-      stopNowGame();
-      gameSubMode = MANUAL;
+      stopNowGame(); gameSubMode = MANUAL;
+      SerialBT.println("Switched to MANUAL mode");
+    }
+    else if (s1 == HIGH && s2 == LOW && s3 == LOW && s4 == LOW && s5 == HIGH) {
+      stopNowGame(); gameSubMode = MANUAL;
       SerialBT.println("Switched to MANUAL mode");
     } else if (s3 == LOW) goForwardGame();
     else if ((s2 == LOW && s1 == HIGH) || s1 == LOW) turnLeftGame();
@@ -1204,35 +1187,42 @@ void executeGameMode() {
       if (s4 == LOW) turnRightGame();
     }
   } else if (gameSubMode == MANUAL) {
+    stopNowGame();
     if (pendingCmd != "") {
       String cmd = pendingCmd;
       pendingCmd = "";
-      cmd.trim();
+      cmd.trim(); cmd.toUpperCase();
       Serial.printf("Game Mode: Processing Command = %s\n", cmd.c_str());
-      if (cmd == "F") { goForwardGame(); SerialBT.println("Moving Forward"); }
-      else if (cmd == "B") { goBackwardGame(); SerialBT.println("Moving Backward"); }
-      else if (cmd == "L") { turnLeftGame(); SerialBT.println("Turning Left"); }
-      else if (cmd == "R") { turnRightGame(); SerialBT.println("Turning Right"); }
-      else if (cmd == "S") { stopNowGame(); SerialBT.println("Stopped"); }
+
+      if (cmd == "F") goForwardGame();
+      else if (cmd == "B") goBackwardGame();
+      else if (cmd == "L") turnRightGame();
+      else if (cmd == "R") turnLeftGame();
+      else if (cmd == "S") stopNowGame();
       else if (cmd == "AUTO") { gameSubMode = LINE_FOLLOWING; SerialBT.println("LINE FOLLOWING"); }
       else if (cmd.startsWith("SPD")) {
         int spd = cmd.substring(3).toInt();
         if (spd >= 0 && spd <= 100) { motorSpeed = spd; SerialBT.printf("Speed %d%%\n", motorSpeed); }
         else SerialBT.println("0-100 only");
       } else SerialBT.println("Unknown cmd");
-      delay(1000);
-      stopNowGame();
-      gameSubMode = LINE_FOLLOWING;
+      delay(600); stopNowGame();
       SerialBT.println("Returning to LINE FOLLOWING mode after manual command");
+    }
+    if (s1 == HIGH || s2 == HIGH || s3 == HIGH || s4 == HIGH || s5 == HIGH) {
+      gameSubMode = LINE_FOLLOWING;
+      SerialBT.println("Line detected, resuming LINE FOLLOWING mode");
     }
   }
 
   updateOLED();
+  updateHands();
+  updateManualBlink(); // Non-blocking LED blinking
   delay(frameDelay);
 }
 
 // ===== Execute Play Mode =====
 void executePlayMode() {
+  // Debug: Log current state periodically
   static unsigned long lastDebug = 0;
   if (millis() - lastDebug >= 1000) {
     String stateStr;
@@ -1243,17 +1233,17 @@ void executePlayMode() {
       case LEFT: stateStr = "LEFT"; break;
       case RIGHT: stateStr = "RIGHT"; break;
     }
-    Serial.printf("Play Mode: Current State = %s, Distance = %.2f
-
- cm\n", stateStr.c_str(), getDistance());
+    Serial.printf("Play Mode: Current State = %s, Distance = %.2f cm\n", stateStr.c_str(), getDistance());
     lastDebug = millis();
   }
 
+  // Check for new commands
   if (pendingCmd != "") {
     String cmd_str = pendingCmd;
     pendingCmd = "";
     cmd_str.trim();
     Serial.printf("Play Mode: Received Command = %s\n", cmd_str.c_str());
+
     if (cmd_str.length() == 1) {
       char cmd = cmd_str[0];
       switch (cmd) {
@@ -1270,6 +1260,7 @@ void executePlayMode() {
     }
   }
 
+  // Ultrasonic sensor obstacle handling
   float distance = getDistance();
   if (!turning && distance > 0 && distance <= 10 && currentRobotState != STOP) {
     stopMotorsPlay();
@@ -1291,6 +1282,7 @@ void executePlayMode() {
     turning = false;
   }
 
+  // Continue executing current robot state
   switch (currentRobotState) {
     case FORWARD: moveForwardPlay(); break;
     case BACKWARD: moveBackwardPlay(); break;
@@ -1300,6 +1292,8 @@ void executePlayMode() {
   }
 
   waveHandsPlay();
+
+  // Update LEDs based on current state
   switch (currentRobotState) {
     case STOP: loadingEffectPlay(); break;
     case FORWARD: forwardEffectPlay(); break;
@@ -1314,6 +1308,7 @@ void executePlayMode() {
 
 // ===== Execute Entertainment Mode =====
 void executeEntertainmentMode() {
+  // Switch dance modes every 3 minutes
   if (millis() - danceStartTime >= DANCE_DURATION) {
     danceMode = (danceMode == 1) ? 2 : 1;
     danceStartTime = millis();
@@ -1321,6 +1316,7 @@ void executeEntertainmentMode() {
     SerialBT.printf("Switching to Dance %d\n", danceMode);
   }
 
+  // Update LEDs and Servos if motors are running
   if (currentMove != STOPPED_E) {
     updateLEDPattern();
     updateServoMotion();
@@ -1331,13 +1327,17 @@ void executeEntertainmentMode() {
     rightArmServo.write(90);
   }
 
+  // Update OLED
   updateOLED();
+
+  // Execute dance routines
   if (danceMode == 1) {
     danceRoutine1();
   } else {
     danceRoutine2();
   }
-  delay(frameDelay);
+
+  delay(frameDelay); // Ensure smooth OLED animation
 }
 
 // ===== Setup =====
@@ -1350,45 +1350,27 @@ void setup() {
   pinMode(LMF, OUTPUT); pinMode(LMB, OUTPUT);
   pinMode(S1, INPUT); pinMode(S2, INPUT); pinMode(S3, INPUT);
   pinMode(S4, INPUT); pinMode(S5, INPUT);
-  pinMode(TRIG_PIN, OUTPUT pinMode(ECHO_PIN, INPUT);
-  pinMode(STATUS_LED, OUTPUT); pinMode(SUCCESS_LED, OUTPUT); pinMode(ERROR_LED, OUTPUT);
-
-  // Initialize digit detection LEDs
-  digitalWrite(STATUS_LED, HIGH);
-  digitalWrite(SUCCESS_LED, LOW);
-  digitalWrite(ERROR_LED, LOW);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
 
   // Servos
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
+  
   gripperServo1.setPeriodHertz(50);
   gripperServo2.setPeriodHertz(50);
   leftArmServo.setPeriodHertz(50);
   rightArmServo.setPeriodHertz(50);
+  
   gripperServo1.attach(SERVO_GRIPPER1_PIN, 500, 2400); gripperServo1.write(0);
   gripperServo2.attach(SERVO_GRIPPER2_PIN, 500, 2400); gripperServo2.write(0);
   leftArmServo.attach(SERVO_LEFT_ARM_PIN, 500, 2400); leftArmServo.write(90);
-  rightArmServo.attach(SERVOE_RIGHT_ARM_PIN, 500, 2400); rightArmServo.write(90);
+  rightArmServo.attach(SERVO_RIGHT_ARM_PIN, 500, 2400); rightArmServo.write(90);
 
   // Bluetooth Serial
   SerialBT.begin("ESP32_SPEAKER");
   Serial.println("Bluetooth initialized: ESP32_SPEAKER");
-
-  // WiFi for digit detection
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.print(".");
-    digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
-  }
-  digitalWrite(STATUS_LED, HIGH);
-  Serial.println();
-  Serial.println("WiFi connected!");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
 
   // LEDs
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
@@ -1405,21 +1387,38 @@ void setup() {
   cfg.pin_ws   = 13;
   cfg.pin_data = 26;
   i2s.begin(cfg);
+
   a2dp_sink.set_on_connection_state_changed(connection_state_changed);
   a2dp_sink.start("ESP32_SPEAKER");
-  a2dp_sink.set_volume(0x7F);
+  a2dp_sink.set_volume(0x7F);  // Max volume
+
+  // WiFi for digit game
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("WiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Setup HTTP server for digit game commands
+  server.on("/digit_game", HTTP_POST, handleDigitGameCommand);
+  server.begin();
+  Serial.println("HTTP server started");
 
   // Initial mode
-  switchToGameMode();
+  switchToGameMode();  // Default to Game Mode
+
   Serial.println("Robot Ready!");
-  Serial.println("Detection distance: 5cm");
-  Serial.println("\n🎮 MANUAL TESTING MODE ENABLED");
-  Serial.println("Type 'help' in Serial Monitor for digit detection testing commands");
   delay(1000);
 }
 
 // ===== Main Loop =====
 void loop() {
+  // Debug: Log current mode and Bluetooth status periodically
   static unsigned long lastStatusCheck = 0;
   if (millis() - lastStatusCheck >= 1000) {
     String modeStr;
@@ -1431,18 +1430,17 @@ void loop() {
     Serial.printf("Current Mode: %s, Bluetooth Status: %s\n", 
                   modeStr.c_str(), 
                   SerialBT.connected() ? "Connected" : "Disconnected");
-    if (gameSubMode == DIGIT_DETECTION) {
-      Serial.printf("Digit Detection State: %s\n", getDigitStateString(digitState).c_str());
-    }
     lastStatusCheck = millis();
   }
 
+  // Check for Bluetooth commands
   if (SerialBT.available()) {
     String cmd = SerialBT.readStringUntil('\n');
-    if (cmd.length() > SEO) {
+    if (cmd.length() > 0) {
       Serial.printf("Main Loop: Bluetooth Raw Command = '%s' (length = %d)\n", cmd.c_str(), cmd.length());
       cmd.trim();
       Serial.printf("Main Loop: Bluetooth Trimmed Command = '%s'\n", cmd.c_str());
+
       if (cmd == "G") {
         Serial.println("Main Loop: Switching to Game Mode via Bluetooth");
         switchToGameMode();
@@ -1457,19 +1455,21 @@ void loop() {
         SerialBT.println("Entertainment Mode Activated - Let's Dance!");
       } else {
         Serial.printf("Main Loop: Passing Bluetooth command '%s' to mode handler\n", cmd.c_str());
-        pendingCmd = cmd;
+        pendingCmd = cmd;  // Pass to mode handler
       }
     } else {
       Serial.println("Main Loop: Empty Bluetooth command received, ignoring");
     }
   }
 
+  // Check for USB Serial commands (for testing)
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     if (cmd.length() > 0) {
       Serial.printf("Main Loop: USB Serial Raw Command = '%s' (length = %d)\n", cmd.c_str(), cmd.length());
       cmd.trim();
       Serial.printf("Main Loop: USB Serial Trimmed Command = '%s'\n", cmd.c_str());
+
       if (cmd == "G") {
         Serial.println("Main Loop: Switching to Game Mode via USB Serial");
         switchToGameMode();
@@ -1487,13 +1487,17 @@ void loop() {
         Serial.println("Entertainment Mode Activated");
       } else {
         Serial.printf("Main Loop: Passing USB Serial command '%s' to mode handler\n", cmd.c_str());
-        pendingCmd = cmd;
+        pendingCmd = cmd;  // Pass to mode handler
       }
     } else {
       Serial.println("Main Loop: Empty USB Serial command received, ignoring");
     }
   }
 
+  // Handle HTTP server
+  server.handleClient();
+
+  // Execute current mode
   if (currentMode == GAME_MODE) {
     executeGameMode();
   } else if (currentMode == PLAY_MODE) {
@@ -1501,4 +1505,14 @@ void loop() {
   } else if (currentMode == ENTERTAINMENT_MODE) {
     executeEntertainmentMode();
   }
+
+  // Temporarily disable disconnection handling for testing
+  /*
+  if (!SerialBT.connected()) {
+    stopMotors();
+    neutralArms();
+    clearLEDs();
+    Serial.println("Bluetooth disconnected, stopping robot");
+  }
+  */
 }
