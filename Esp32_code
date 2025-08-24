@@ -6,25 +6,20 @@
 #include <U8g2lib.h>
 #include "AudioTools.h"
 #include "BluetoothA2DPSink.h"
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
-
+#include <map></map>
 // ===== OLED Setup =====
 U8G2_SH1107_128X128_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 const int screenWidth = 128;
 const int screenHeight = 128;
 const int eyeballRadius = 40;
-const int centerX = 90;
-const int centerY = 70;
+int centerX = 90;
+int centerY = 70;
 float currentX = centerX;
 float currentY = centerY;
 const int frameDelay = 20;
 const float moveSpeed = 6.0;
-
-// Game Mode OLED variables (from provided game mode code)
-int8_t offsetX = 0;
-int8_t offsetY = 0;
+int16_t offsetX = 0;
+int16_t offsetY = 0;
 int8_t directionX = 1;
 int8_t directionY = 1;
 bool isBlinking = false;
@@ -33,19 +28,15 @@ const int blinkDuration = 1; // Faster blink (frames)
 int triangleVertex = 0; // For triangle movement in line following
 unsigned long lastMoveTime = 0;
 const unsigned long moveInterval = 2500; // Slower movement (ms)
-
 enum BlinkState { OPEN, CLOSING, CLOSED, OPENING };
 BlinkState blinkState = OPEN;
 int blinkTimer = 0;
-
 // Shared robot state for OLED
 enum RobotState { STOP, FORWARD, BACKWARD, LEFT, RIGHT };
 RobotState currentRobotState = STOP;
-
 // Idle glance variables for Play Mode
 int idleDirection = 0;
 unsigned long lastIdleMove = 0;
-
 // Entertainment Mode OLED variables
 float shapeX = centerX;
 float shapeY = centerY;
@@ -58,58 +49,53 @@ unsigned long lastBlink = 0;
 const unsigned long BLINK_ON = 300; // 300ms on
 const unsigned long BLINK_OFF = 150; // 150ms off
 bool showText = false;
-unsigned long lastMoveTime = 0;
 const unsigned long TEXT_DELAY = 1000; // 1s after movement stops
 bool startupAnimation = true;
 float textX = screenWidth + 100; // Start off-screen right
 const float textSpeed = 7.0; // Pixels per frame for ~2s animation
 unsigned long startupStartTime = 0;
-
 // ===== LED Ring Configuration =====
 #define LED_PIN 15
 #define NUM_LEDS 16
 #define BRIGHTNESS 240
 #define LED_TYPE WS2812
 #define COLOR_ORDER GRB
-#define FRAMES_PER_SECOND 120   // Animation speed
 CRGB leds[NUM_LEDS];
 uint8_t gHue = 0; // Rotating "base color"
-
 // ===== Motor & Speed Control =====
-int motorSpeed = 75;
-unsigned long lastPulse = 0;
-bool motorState = false;
-
+int motorSpeed = 55;
+std::map<int, unsigned long> lastPulseMap;
+std::map<int, bool> motorStateMap;
 #define digitalWrite_original digitalWrite
 void speedDigitalWrite(int pin, int state) {
-  if (state == HIGH && motorSpeed < 100) {
-    unsigned long now = millis();
-    int onTime = motorSpeed;
-    int offTime = 100 - motorSpeed;
-    if (motorState) {
-      if (now - lastPulse >= onTime) {
-        digitalWrite_original(pin, LOW);
-        motorState = false;
-        lastPulse = now;
-      } else digitalWrite_original(pin, HIGH);
-    } else {
-      if (now - lastPulse >= offTime) {
-        digitalWrite_original(pin, HIGH);
-        motorState = true;
-        lastPulse = now;
-      } else digitalWrite_original(pin, LOW);
-    }
-  } else digitalWrite_original(pin, state);
+unsigned long &lastPulse = lastPulseMap[pin];
+bool &motorState = motorStateMap[pin];
+unsigned long now = millis();
+int onTime = motorSpeed;
+int offTime = 100 - motorSpeed;
+if (state == HIGH && motorSpeed < 100) {
+if (motorState) {
+if (now - lastPulse >= onTime) {
+digitalWrite_original(pin, LOW);
+motorState = false;
+lastPulse = now;
+} else digitalWrite_original(pin, HIGH);
+} else {
+if (now - lastPulse >= offTime) {
+digitalWrite_original(pin, HIGH);
+motorState = true;
+lastPulse = now;
+} else digitalWrite_original(pin, LOW);
+}
+} else digitalWrite_original(pin, state);
 }
 #undef digitalWrite
 #define digitalWrite(pin, state) speedDigitalWrite(pin, state)
-
 // Motor pins
-#define RMF 4
-#define RMB 16
-#define LMF 17
-#define LMB 5
-
+#define rmf 17  // Right Motor Forward
+#define rmb 5   // Right Motor Backward
+#define lmf 4   // Left Motor Forward
+#define lmb 16  // Left Motor Backward
 // IR sensor pins (Game Mode only)
 #define S1 25
 #define S2 33
@@ -117,64 +103,38 @@ void speedDigitalWrite(int pin, int state) {
 #define S4 35
 #define S5 34
 #define NUM_SENSORS 5
-int sensorPins[NUM_SENSORS] = {25, 33, 32, 35, 34};  // 5 IR sensors
-
-// PID Settings (Game Mode)
-int baseSpeed = 120;          // Base speed
-float Kp = 2.5, Ki = 0.0, Kd = 2.0;
-float lastError = 0, integral = 0;
-
+int sensorPins[NUM_SENSORS] = {S1, S2, S3, S4, S5};
 // Ultrasonic pins
 #define TRIG_PIN 27
 #define ECHO_PIN 14
-
 // Servo pins
-#define SERVO_GRIPPER1_PIN 2   // Game Mode obstacle handling
-#define SERVO_GRIPPER2_PIN 23  // Game Mode obstacle handling
+#define SERVO_GRIPPER1_PIN 23
+#define SERVO_GRIPPER2_PIN 2
 #define SERVO_LEFT_ARM_PIN 19
 #define SERVO_RIGHT_ARM_PIN 18
-
 Servo gripperServo1;
 Servo gripperServo2;
 Servo leftArmServo;
 Servo rightArmServo;
-
+// PID settings for Game Mode
+int baseSpeed = 80;          // Base speed
+float Kp = 2.5, Ki = 0.0, Kd = 2.0;
+float lastError = 0, integral = 0;
 // Bluetooth
 BluetoothSerial SerialBT;
-
 // Amplifier Objects
 I2SStream i2s;
 BluetoothA2DPSink a2dp_sink(i2s);
-
-// WIFI CREDENTIALS (Game Mode)
-const char* ssid = "imf";
-const char* password = "7C4C7DF1";
-const char* espCamUrl = "http://192.168.8.151/capture_and_ocr";
-
-// GAME STATE (Game Mode)
-String digit1 = "";
-String digit2 = "";
-bool hasResult = false;
-bool match = false;
-
-// MODE CONTROL (Game Mode)
+// Modes for unified code
+enum Mode { GAME_MODE, PLAY_MODE, ENTERTAINMENT_MODE };
+Mode currentMode = PLAY_MODE;
+// Pending command for mode-specific handling
+String pendingCmd = "";
+// Game Mode specific variables
 bool inManualMode = false;
 unsigned long manualStartTime = 0;
 const unsigned long manualDuration = 750; // 0.75 second
-bool obstacleToggle = false; // alternate between two behaviors
-
-// Modes for unified code
-enum Mode { GAME_MODE, PLAY_MODE, ENTERTAINMENT_MODE };
-Mode currentMode = GAME_MODE;
-
-// Pending command for mode-specific handling
-String pendingCmd = "";
-
-// Game Mode specific variables
-enum GameRobotSubMode { LINE_FOLLOWING, MANUAL };
-GameRobotSubMode gameSubMode = LINE_FOLLOWING;
-bool firstObstacle = true;
-
+bool obstacleToggle = false; // Alternate between two behaviors
 // Play Mode specific variables
 bool turning = false;
 unsigned long turnStartTime = 0;
@@ -182,7 +142,6 @@ int servoPos = 60;
 int increment = 10;
 bool waving = false;
 unsigned long lastWaveTime = 0;
-
 // Entertainment Mode specific variables
 int danceMode = 1; // 1 = Dance 1, 2 = Dance 2
 unsigned long danceStartTime = 0;
@@ -194,1507 +153,1218 @@ int rightAngle = 120;
 bool servoDirection = true; // for swinging
 enum MoveType { FORWARD_E, BACKWARD_E, TURN_LEFT_E, TURN_RIGHT_E, SPIN_E, STOPPED_E };
 MoveType currentMove = STOPPED_E;
-
 // Minion Colors for Entertainment Mode
 const CRGB minionYellow = CRGB(255, 255, 0);
 const CRGB minionBlue = CRGB(0, 0, 255);
-
 // Callback for Bluetooth audio connection changes
 void connection_state_changed(esp_a2d_connection_state_t state, void *ptr) {
-  Serial.printf("Bluetooth A2DP connection state changed: %d\n", (int)state);
+Serial.printf("Bluetooth A2DP connection state changed: %d\n", (int)state);
 }
-
 // Common stop motors function
 void stopMotors() {
-  digitalWrite(RMF, LOW);
-  digitalWrite(RMB, LOW);
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, LOW);
-  currentRobotState = STOP;
-  Serial.println("Motors stopped");
+digitalWrite(rmf, LOW);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, LOW);
+currentRobotState = STOP;
+Serial.println("Motors stopped");
 }
-
 // Common clear LEDs
 void clearLEDs() {
-  FastLED.clear();
-  FastLED.show();
+FastLED.clear();
+FastLED.show();
 }
-
 // Common neutral arms
 void neutralArms() {
-  leftArmServo.write(90);
-  rightArmServo.write(90);
+leftArmServo.write(90);
+rightArmServo.write(90);
 }
-
-// Common get distance (combined with timeout handling)
+// Common get distance (with retry mechanism)
 float getDistance() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-  if (duration == 0) return -1;
-  return duration * 0.034 / 2;
+const int maxRetries = 3;
+for (int i = 0; i < maxRetries; i++) {
+digitalWrite(TRIG_PIN, LOW);
+delayMicroseconds(2);
+digitalWrite(TRIG_PIN, HIGH);
+delayMicroseconds(10);
+digitalWrite(TRIG_PIN, LOW);
+long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+if (duration != 0) {
+float distance = duration * 0.034 / 2;
+Serial.printf("Ultrasonic Distance: %.2f cm\n", distance);
+return distance;
 }
-
-// ===== Game Mode OLED Drawing (from provided code) =====
-void drawEye(int16_t x, int16_t y, bool closed) {
-  u8g2.setDrawColor(1); // White for SH1107 OLED
-  if (!closed) {
-    // Open eye: filled white circle with radius 35
-    u8g2.drawDisc(x, y, 35, U8G2_DRAW_ALL);
-  } else {
-    // Closed eye: white horizontal line
-    u8g2.drawLine(x - 35, y, x + 35, y);
-  }
+Serial.println("Ultrasonic: No echo received, retrying...");
+delay(10); // Short delay between retries
 }
-
-// ===== Game Mode Hand Servo Control =====
-void handleHandServos() {
-  static unsigned long lastServoMove = 0;
-  static bool waveUp = true;
-  const unsigned long waveInterval = 1000; // Slower wave every 1000ms
-
-  if (millis() - lastServoMove >= waveInterval) {
-    if (waveUp) {
-      leftArmServo.write(45);  // Left hand wave up
-      rightArmServo.write(45);  // Right hand wave up
-    } else {
-      leftArmServo.write(135); // Left hand wave down
-      rightArmServo.write(135); // Right hand wave down
-    }
-    waveUp = !waveUp; // Toggle wave direction
-    lastServoMove = millis();
-  }
+Serial.println("Ultrasonic: Failed to get valid reading");
+return -1;
 }
-
-// ===== Game Mode LED Effects (from provided code) =====
-void startupAnimation() {
-  // White chase
-  for(int i = 0; i < NUM_LEDS; i++) {
-    leds[i] = CRGB::White;
-    FastLED.show();
-    delay(30);
-    leds[i] = CRGB::Black;
-  }
-  
-  // Rainbow fill
-  fill_rainbow(leds, NUM_LEDS, 0, 7);
-  FastLED.show();
-  delay(500);
-  
-  // Clear
-  FastLED.clear();
-  FastLED.show();
-}
-
-void rotatingColors() {
-  static uint8_t hue = 0;
-  for(int i = 0; i < NUM_LEDS; i++) {
-    leds[i] = CHSV((hue + (i * 255 / NUM_LEDS)) % 255, 255, 255);
-  }
-  hue += 5; // Rotate colors
-}
-
-void solidBlueYellow() {
-  for(int i = 0; i < NUM_LEDS; i++) {
-    if(i % 2 == 0) {
-      leds[i] = CRGB::Blue;
-    } else {
-      leds[i] = CRGB::Yellow;
-    }
-  }
-}
-
-void flashingBlueYellow() {
-  static bool isBlue = true;
-  static unsigned long lastFlash = 0;
-  const unsigned long flashInterval = 500; // Flash every 500ms
-
-  if (millis() - lastFlash >= flashInterval) {
-    isBlue = !isBlue; // Toggle color
-    lastFlash = millis();
-  }
-
-  fill_solid(leds, NUM_LEDS, isBlue ? CRGB::Blue : CRGB::Yellow);
-}
-
-void loadingBlueYellow() {
-  static uint8_t pos = 0;
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  for(int i = 0; i < 4; i++) {
-    int index = (pos + i) % NUM_LEDS;
-    if(i % 2 == 0) {
-      leds[index] = CRGB::Blue;
-    } else {
-      leds[index] = CRGB::Yellow;
-    }
-  }
-  pos = (pos + 1) % NUM_LEDS;
-}
-
-void loadingBlueOnly() {
-  static uint8_t pos = 0;
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  for(int i = 0; i < 4; i++) {
-    leds[(pos + i) % NUM_LEDS] = CRGB::Blue;
-  }
-  pos = (pos + 1) % NUM_LEDS;
-}
-
-void loadingYellowOnly() {
-  static uint8_t pos = 0;
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  for(int i = 0; i < 4; i++) {
-    leds[(pos + i) % NUM_LEDS] = CRGB::Yellow;
-  }
-  pos = (pos + 1) % NUM_LEDS;
-}
-
-void flashingRed() {
-  static bool isRed = true;
-  static unsigned long lastFlash = 0;
-  const unsigned long flashInterval = 500; // Flash every 500ms
-
-  if (millis() - lastFlash >= flashInterval) {
-    isRed = !isRed; // Toggle color
-    lastFlash = millis();
-  }
-
-  fill_solid(leds, NUM_LEDS, isRed ? CRGB::Red : CRGB::Black);
-}
-
-void loadingGreen() {
-  static uint8_t pos = 0;
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  for(int i = 0; i < 4; i++) {
-    leds[(pos + i) % NUM_LEDS] = CRGB::Green;
-  }
-  pos = (pos + 1) % NUM_LEDS;
-}
-
-void loadingBlue() {
-  static uint8_t pos = 0;
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  for(int i = 0; i < 4; i++) {
-    leds[(pos + i) % NUM_LEDS] = CRGB::Blue;
-  }
-  pos = (pos + 1) % NUM_LEDS;
-}
-
-void loadingRed() {
-  static uint8_t pos = 0;
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  for(int i = 0; i < 4; i++) {
-    leds[(pos + i) % NUM_LEDS] = CRGB::Red;
-  }
-  pos = (pos + 1) % NUM_LEDS;
-}
-
-// ===== Game Mode Motor Functions =====
-void moveForwardGame() {
-  digitalWrite(RMF, HIGH);
-  digitalWrite(RMB, LOW);
-  digitalWrite(LMF, HIGH);
-  digitalWrite(LMB, LOW);
-  handleHandServos(); // Wave hands during movement
-  currentRobotState = FORWARD;
-  Serial.println("Forward");
-  loadingGreen(); // Green loading when moving forward in manual mode
-}
-
-void moveBackwardGame() {
-  digitalWrite(RMF, LOW);
-  digitalWrite(RMB, HIGH);
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, HIGH);
-  handleHandServos(); // Wave hands during movement
-  currentRobotState = BACKWARD;
-  Serial.println("Backward");
-  flashingRed(); // Flashing red when moving backward
-}
-
-void turnLeftGame() {
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, LOW);
-  digitalWrite(RMF, HIGH);
-  digitalWrite(RMB, LOW);
-  handleHandServos(); // Wave hands during movement
-  currentRobotState = LEFT;
-  Serial.println("Left");
-  flashingRed(); // Flashing red when turning left
-}
-
-void turnRightGame() {
-  digitalWrite(LMF, HIGH);
-  digitalWrite(LMB, LOW);
-  digitalWrite(RMF, LOW);
-  digitalWrite(RMB, LOW);
-  handleHandServos(); // Wave hands during movement
-  currentRobotState = RIGHT;
-  Serial.println("Right");
-  flashingRed(); // Flashing red when turning right
-}
-
-void stopNowGame() {
-  digitalWrite(RMF, LOW);
-  digitalWrite(RMB, LOW);
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, LOW);
-  leftArmServo.write(90); // Left hand stationary
-  rightArmServo.write(90); // Right hand stationary
-  currentRobotState = STOP;
-  Serial.println("Motors stopped");
-  rotatingColors(); // Five colors rotating when stopped
-}
-
-// ===== Game Mode Bluetooth Command Handler =====
-void handleBTCommand(String cmd) {
-  Serial.println("BT Command: " + cmd);
-
-  if (cmd.length() != 1) {
-    Serial.println("Unknown command");
-    SerialBT.println("Unknown command");
-    return;
-  }
-
-  char command = cmd[0];
-  switch (command) {
-    case 'F':
-      moveForwardGame();
-      inManualMode = true;
-      manualStartTime = millis();
-      SerialBT.println("Moving Forward");
-      break;
-
-    case 'B':
-      moveBackwardGame();
-      inManualMode = true;
-      manualStartTime = millis();
-      SerialBT.println("Moving Backward");
-      break;
-
-    case 'L':
-      turnLeftGame();
-      delay(1000);       // Turn for 1 second
-      stopNowGame();      // Then stop
-      inManualMode = false; // Immediately go back to line following
-      SerialBT.println("Turning Left");
-      return; // Skip normal manual timer
-
-    case 'R':
-      turnRightGame();
-      delay(1000);       // Turn for 1 second
-      stopNowGame();      // Then stop
-      inManualMode = false; // Immediately go back to line following
-      SerialBT.println("Turning Right");
-      return; // Skip normal manual timer
-
-    case 'S':
-      stopNowGame();
-      inManualMode = true;
-      manualStartTime = millis();
-      SerialBT.println("Stopped");
-      break;
-
-    default:
-      Serial.println("Unknown command");
-      SerialBT.println("Unknown command");
-      break;
-  }
-}
-
-// ===== Game Mode Get Digit from ESP32-CAM =====
-String getDigitFromCam() {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin(espCamUrl);
-    int httpCode = http.GET();
-    if (httpCode == 200) {
-      String payload = http.getString();
-      StaticJsonDocument<200> doc;
-      DeserializationError error = deserializeJson(doc, payload);
-      if (!error && doc["success"]) {
-        return doc["digit"].as<String>();
-      } else {
-        Serial.println("Failed to parse JSON or no success");
-      }
-    } else {
-      Serial.printf("HTTP GET failed, code: %d\n", httpCode);
-    }
-    http.end();
-  } else {
-    Serial.println("WiFi not connected");
-  }
-  return "";
-}
-
-// ===== Game Mode Compare Digits =====
-void compareDigits() {
-  if (digit1 == digit2) {
-    match = true;
-  } else {
-    match = false;
-  }
-  hasResult = true;
-  Serial.printf("Digits: %s and %s - Result: %s\n", digit1.c_str(), digit2.c_str(), match ? "Win" : "Fail");
-  SerialBT.printf("Digits: %s and %s - Result: %s\n", digit1.c_str(), digit2.c_str(), match ? "Win" : "Fail");
-}
-
-// ===== Game Mode Obstacle Handler =====
-void handleObstacle() {
-  stopNowGame();
-  Serial.println("🚧 Obstacle detected");
-  SerialBT.println("Obstacle detected!");
-  if (!obstacleToggle) {
-    loadingBlueOnly(); // Blue loading animation during servo actions
-    // First behavior: original servo actions + left hand wave
-    loadingRed();
-    delay(1000);
-    gripperServo1.write(35);
-    delay(1500);
-    gripperServo2.write(180);
-    // Left hand wave: move leftArmServo back and forth
-    leftArmServo.write(45);  // Wave up
-    delay(500);
-    leftArmServo.write(135); // Wave down
-    delay(500);
-    leftArmServo.write(90);  // Return to neutral
-    delay(1000);
-    // Red loading during stop
-  } else {
-    loadingYellowOnly(); // Yellow loading animation during servo actions
-    // Second behavior: original servo actions + right hand wave
-    loadingRed();
-    delay(1000);
-    gripperServo2.write(0);
-    delay(1500);
-    gripperServo1.write(0);
-    // Right hand wave: move rightArmServo back and forth
-    rightArmServo.write(45);  // Wave up
-    delay(500);
-    rightArmServo.write(135); // Wave down
-    delay(500);
-    rightArmServo.write(90);  // Return to neutral
-    delay(1000);
-    moveBackwardGame();
-    delay(1300);
-    stopNowGame();
-    // Red loading during stop
-  }
-
-  // Add OCR digit detection
-  String detectedDigit = getDigitFromCam();
-  if (detectedDigit != "") {
-    if (digit1 == "") {
-      digit1 = detectedDigit;
-      Serial.println("First digit: " + digit1);
-      SerialBT.println("First digit: " + digit1);
-    } else if (digit2 == "") {
-      digit2 = detectedDigit;
-      Serial.println("Second digit: " + digit2);
-      SerialBT.println("Second digit: " + digit2);
-      compareDigits();
-    }
-  }
-
-  obstacleToggle = !obstacleToggle; // flip mode
-}
-
-// ===== Game Mode Line Following =====
-void lineFollowing() {
-  int sensorValues[NUM_SENSORS];
-  int error = 0, total = 0;
-  bool allSensorsLow = true;
-
-  // Read sensors
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    sensorValues[i] = digitalRead(sensorPins[i]);
-    if (sensorValues[i] == HIGH) allSensorsLow = false;
-  }
-
-  // If line lost → stop
-  if (allSensorsLow) {
-    stopNowGame();
-    rotatingColors(); // Five colors rotating
-    gameSubMode = MANUAL;
-    SerialBT.println("Switched to MANUAL mode");
-    return;
-  }
-
-  // Calculate error
-  for (int i = 0; i < NUM_SENSORS; i++) {
-    if (sensorValues[i] == HIGH) {
-      error += (i - 2) * 100;
-      total++;
-    }
-  }
-  if (total > 0) error /= total;
-
-  // PID control
-  integral += error;
-  float derivative = error - lastError;
-  float output = Kp * error + Ki * integral + Kd * derivative;
-  lastError = error;
-
-  int leftSpeed = constrain(baseSpeed - output, 0, 255);
-  int rightSpeed = constrain(baseSpeed + output, 0, 255);
-
-  // Apply motor control
-  if (error > 0) {
-    // Turn right
-    digitalWrite(RMF, HIGH);
-    digitalWrite(RMB, LOW);
-    digitalWrite(LMF, LOW);
-    digitalWrite(LMB, HIGH);
-    handleHandServos(); // Wave hands during movement
-    currentRobotState = RIGHT;
-  } else if (error < 0) {
-    // Turn left
-    digitalWrite(RMF, LOW);
-    digitalWrite(RMB, HIGH);
-    digitalWrite(LMF, HIGH);
-    digitalWrite(LMB, LOW);
-    handleHandServos(); // Wave hands during movement
-    currentRobotState = LEFT;
-  } else {
-    // Forward
-    digitalWrite(RMF, HIGH);
-    digitalWrite(RMB, LOW);
-    digitalWrite(LMF, HIGH);
-    digitalWrite(LMB, LOW);
-    handleHandServos(); // Wave hands during movement
-    currentRobotState = FORWARD;
-  }
-  flashingBlueYellow(); // Blue and yellow flashing when line following
-}
-
-// ===== OLED Draw Eye (Parameterized for inversion, used in Play Mode) =====
+// ===== OLED Draw Eye (Parameterized for inversion) =====
 void drawEye(bool inverted, float x, float y, float eyeHeightRatio) {
-  int16_t ix = (int16_t)x;
-  int16_t iy = (int16_t)y;
-
-  u8g2.setDrawColor(inverted ? 1 : 0);
-  u8g2.drawBox(0, 0, screenWidth, screenHeight);
-
-  u8g2.setDrawColor(inverted ? 0 : 1);
-  int ry = (int)(eyeballRadius * eyeHeightRatio);
-  if (ry < 1) ry = 1;
-  for (int16_t dy = -ry; dy <= ry; dy++) {
-    float dx = eyeballRadius * sqrt(1.0f - (dy * dy) / float(ry * ry));
-    int16_t left = ix - (int16_t)dx;
-    int16_t right = ix + (int16_t)dx;
-    if (left < 0) left = 0;
-    if (right >= screenWidth) right = screenWidth - 1;
-    int16_t yCoord = iy + dy;
-    if (yCoord < 0) yCoord = 0;
-    if (yCoord >= screenHeight) yCoord = screenHeight - 1;
-    u8g2.drawHLine(left, yCoord, right - left + 1);
-  }
+int16_t ix = (int16_t)x;
+int16_t iy = (int16_t)y;
+u8g2.setDrawColor(inverted ? 1 : 0);
+u8g2.drawBox(0, 0, screenWidth, screenHeight);
+u8g2.setDrawColor(inverted ? 0 : 1);
+int ry = (int)(eyeballRadius * eyeHeightRatio);
+if (ry < 1) ry = 1;
+for (int16_t dy = -ry; dy <= ry; dy++) {
+float dx = eyeballRadius * sqrt(1.0f - (dy * dy) / float(ry * ry));
+int16_t left = ix - (int16_t)dx;
+int16_t right = ix + (int16_t)dx;
+if (left < 0) left = 0;
+if (right >= screenWidth) right = screenWidth - 1;
+int16_t yCoord = iy + dy;
+if (yCoord < 0) yCoord = 0;
+if (yCoord >= screenHeight) yCoord = screenHeight - 1;
+u8g2.drawHLine(left, yCoord, right - left + 1);
 }
-
+}
+// Game Mode OLED Eye Drawing
+void drawGameEye(int16_t x, int16_t y, bool closed) {
+u8g2.setDrawColor(1); // White for SH1107 OLED
+if (!closed) {
+// Open eye: filled white circle with radius 35
+u8g2.drawDisc(x, y, 35, U8G2_DRAW_ALL);
+} else {
+// Closed eye: white horizontal line
+u8g2.drawLine(x - 35, y, x + 35, y);
+}
+}
 // ===== Entertainment Mode OLED Drawing Functions =====
 void drawCircle(float x, float y) {
-  u8g2.drawDisc((int)x, (int)y, 30, U8G2_DRAW_ALL); // Larger radius
+u8g2.drawDisc((int)x, (int)y, 30, U8G2_DRAW_ALL); // Larger radius
 }
-
 void drawHeart(float x, float y) {
-  // Scaled heart (~60x60 pixels)
-  u8g2.drawCircle((int)x - 15, (int)y - 15, 15, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
-  u8g2.drawCircle((int)x + 15, (int)y - 15, 15, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
-  u8g2.drawLine((int)x - 30, (int)y - 15, (int)x, (int)y + 30);
-  u8g2.drawLine((int)x + 30, (int)y - 15, (int)x, (int)y + 30);
+// Scaled heart (~60x60 pixels)
+u8g2.drawCircle((int)x - 15, (int)y - 15, 15, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+u8g2.drawCircle((int)x + 15, (int)y - 15, 15, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+u8g2.drawLine((int)x - 30, (int)y - 15, (int)x, (int)y + 30);
+u8g2.drawLine((int)x + 30, (int)y - 15, (int)x, (int)y + 30);
 }
-
 void drawTriangle(float x, float y) {
-  // Larger equilateral triangle (~60x60 pixels)
-  int x1 = (int)x;
-  int y1 = (int)y - 30;
-  int x2 = (int)x - 30;
-  int y2 = (int)y + 30;
-  int x3 = (int)x + 30;
-  int y3 = (int)y + 30;
-  u8g2.drawTriangle(x1, y1, x2, y2, x3, y3);
+// Larger equilateral triangle (~60x60 pixels)
+int x1 = (int)x;
+int y1 = (int)y - 30;
+int x2 = (int)x - 30;
+int y2 = (int)y + 30;
+int x3 = (int)x + 30;
+int y3 = (int)y + 30;
+u8g2.drawTriangle(x1, y1, x2, y2, x3, y3);
 }
-
 void drawShape() {
-  if (!shapeVisible) return;
-  u8g2.setDrawColor(1); // White shape
-  switch (currentShape) {
-    case CIRCLE: drawCircle(shapeX, shapeY); break;
-    case HEART: drawHeart(shapeX, shapeY); break;
-    case TRIANGLE: drawTriangle(shapeX, shapeY); break;
-  }
+if (!shapeVisible) return;
+u8g2.setDrawColor(1); // White shape
+switch (currentShape) {
+case CIRCLE: drawCircle(shapeX, shapeY); break;
+case HEART: drawHeart(shapeX, shapeY); break;
+case TRIANGLE: drawTriangle(shapeX, shapeY); break;
 }
-
+}
 // ===== OLED Update (Mode-specific behavior) =====
 void updateOLED() {
-  u8g2.clearBuffer();
-
-  if (currentMode == ENTERTAINMENT_MODE) {
-    // Entertainment Mode OLED
-    u8g2.setDrawColor(0);
-    u8g2.drawBox(0, 0, screenWidth, screenHeight); // Black background
-
-    if (startupAnimation) {
-      // Animate "Let's Dance" from right to left
-      u8g2.setFont(u8g2_font_fub20_tf);
-      u8g2.setDrawColor(1); // White text
-      const char* text = "Let's Dance";
-      u8g2.drawStr((int)textX, centerY + 10, text);
-      textX -= textSpeed;
-      if (textX < -100) {
-        startupAnimation = false; // End animation
-        shapeX = centerX; // Reset shape position
-        shapeY = centerY;
-      }
-      u8g2.sendBuffer();
-      return;
-    }
-
-    // Switch shapes every 5 seconds
-    if (millis() - lastShapeSwitch >= SHAPE_SWITCH_INTERVAL) {
-      currentShape = (ShapeType)((currentShape + 1) % 3); // Cycle: CIRCLE -> HEART -> TRIANGLE
-      lastShapeSwitch = millis();
-    }
-
-    // Update shape position
-    float targetX = shapeX;
-    float targetY = shapeY;
-    bool isMoving = false;
-    if (currentMove == STOPPED_E) {
-      if (millis() - lastIdleMove >= 1000) {
-        lastIdleMove = millis();
-        idleDirection = random(4); // 0: left, 1: right, 2: up, 3: down
-      }
-      switch (idleDirection) {
-        case 0: targetX -= 2.0; isMoving = true; break; // Left
-        case 1: targetX += 2.0; isMoving = true; break; // Right
-        case 2: targetY -= 2.0; isMoving = true; break; // Up
-        case 3: targetY += 2.0; isMoving = true; break; // Down
-      }
-    } else {
-      switch (currentMove) {
-        case FORWARD_E: targetY -= 2.0; isMoving = true; break; // Up
-        case BACKWARD_E: targetY += 2.0; isMoving = true; break; // Down
-        case TURN_LEFT_E: targetX -= 2.0; isMoving = true; break; // Left
-        case TURN_RIGHT_E: targetX += 2.0; isMoving = true; break; // Right
-        case SPIN_E: targetX += 2.0; isMoving = true; break; // Right
-        default: break;
-      }
-    }
-
-    // Smooth movement
-    if (abs(targetX - shapeX) > 2.0) shapeX += (targetX > shapeX) ? 2.0 : -2.0;
-    else shapeX = targetX;
-    if (abs(targetY - shapeY) > 2.0) shapeY += (targetY > shapeY) ? 2.0 : -2.0;
-    else shapeY = targetY;
-
-    // Constrain position for larger shapes
-    shapeX = constrain(shapeX, 40, screenWidth - 40);
-    shapeY = constrain(shapeY, 40, screenHeight - 40);
-
-    // Update text display
-    if (isMoving) {
-      lastMoveTime = millis();
-      showText = false;
-    } else if (millis() - lastMoveTime >= TEXT_DELAY) {
-      showText = true;
-    }
-
-    // Draw content
-    if (showText) {
-      u8g2.setFont(u8g2_font_fub20_tf); // Larger font
-      u8g2.setDrawColor(1); // White text
-      const char* text = "Let's Dance";
-      int textWidth = u8g2.getStrWidth(text);
-      u8g2.drawStr((screenWidth - textWidth) / 2, centerY + 10, text); // Centered
-    } else {
-      // Blink shape
-      if (shapeVisible && millis() - lastBlink >= BLINK_ON) {
-        shapeVisible = false;
-        lastBlink = millis();
-      } else if (!shapeVisible && millis() - lastBlink >= BLINK_OFF) {
-        shapeVisible = true;
-        lastBlink = millis();
-      }
-      drawShape();
-    }
-  } else if (currentMode == GAME_MODE) {
-    // Game Mode OLED (from provided code)
-    if (hasResult) {
-      u8g2.setFont(u8g2_font_ncenB24_tr);
-      const char* text = match ? "Win!" : "Fail";
-      int16_t textWidth = u8g2.getStrWidth(text);
-      u8g2.drawStr((128 - textWidth) / 2, 64, text);
-    } else {
-      // Update OLED display based on mode
-      if (inManualMode) {
-        // Manual mode eye movement
-        static char lastCommand = 'S';
-        if (pendingCmd != "") {
-          lastCommand = pendingCmd[0];
-        }
-        if (millis() - lastMoveTime >= moveInterval) {
-          switch (lastCommand) {
-            case 'F':
-              offsetY -= 1; // Eye moves up
-              break;
-            case 'L':
-              offsetX -= 1; // Eye moves left
-              break;
-            case 'R':
-              offsetX += 1; // Eye moves right
-              break;
-            default:
-              // No movement for backward or stop
-              break;
-          }
-          offsetX = constrain(offsetX, -10, 10);
-          offsetY = constrain(offsetY, -10, 10);
-          lastMoveTime = millis();
-        }
-      } else if (!inManualMode && digitalRead(RMF) == LOW && digitalRead(RMB) == LOW && digitalRead(LMF) == LOW && digitalRead(LMB) == LOW) {
-        // Stopped state: eye blinks, moves in one direction, and centers
-        currentX = centerX; // Center the eye
-        currentY = centerY;
-        offsetX = 0;
-        offsetY = 0;
-        if (millis() - lastMoveTime >= moveInterval) {
-          offsetX += directionX;
-          if (offsetX > 10 || offsetX < -10) {
-            directionX = -directionX;
-            isBlinking = true;
-          }
-          lastMoveTime = millis();
-        }
-      } else {
-        // Line following: eye moves in a triangle
-        if (millis() - lastMoveTime >= moveInterval) {
-          static const int16_t trianglePoints[3][2] = {{97, 40}, {67, 100}, {127, 100}}; // Top, bottom-left, bottom-right
-          currentX = trianglePoints[triangleVertex][0];
-          currentY = trianglePoints[triangleVertex][1];
-          triangleVertex = (triangleVertex + 1) % 3;
-          offsetX = 0;
-          offsetY = 0;
-          lastMoveTime = millis();
-        }
-      }
-
-      // Handle blinking
-      if (isBlinking) {
-        drawEye(currentX + offsetX, currentY + offsetY, true);
-        blinkFrameCount++;
-        if (blinkFrameCount > blinkDuration) {
-          isBlinking = false;
-          blinkFrameCount = 0;
-        }
-      } else {
-        drawEye(currentX + offsetX, currentY + offsetY, false);
-        // Trigger faster blinks randomly
-        if (random(100) < 30) { // 30% chance per frame to blink
-          isBlinking = true;
-          blinkFrameCount = 0;
-        }
-      }
-    }
-  } else {
-    // Play Mode OLED (existing eye behavior)
-    int targetX = centerX;
-    int targetY = centerY;
-
-    int openBlinkThreshold = 400;
-    float verticalOffset = 50;
-
-    if (currentRobotState == STOP) {
-      unsigned long currentTime = millis();
-      if (currentTime - lastIdleMove >= 1000) {
-        lastIdleMove = currentTime;
-        idleDirection++;
-        if (idleDirection > 8) idleDirection = 0;
-      }
-
-      if (idleDirection == 1) targetX = centerX - 25;
-      else if (idleDirection == 3) targetX = centerX + 25;
-      else if (idleDirection == 5) targetY = centerY - verticalOffset;
-      else if (idleDirection == 7) targetY = centerY + verticalOffset;
-    } else {
-      switch (currentRobotState) {
-        case FORWARD:  targetY = centerY - verticalOffset; break;
-        case BACKWARD: targetY = centerY + verticalOffset; break;
-        case LEFT:     targetX = centerX - 25; break;
-        case RIGHT:    targetX = centerX + 25; break;
-        default: break;
-      }
-    }
-
-    if (abs(targetX - currentX) > moveSpeed)
-      currentX += (targetX > currentX) ? moveSpeed : -moveSpeed;
-    else
-      currentX = targetX;
-
-    if (abs(targetY - currentY) > moveSpeed)
-      currentY += (targetY > currentY) ? moveSpeed : -moveSpeed;
-    else
-      currentY = targetY;
-
-    currentX = constrain(currentX, eyeballRadius, screenWidth - eyeballRadius);
-    currentY = constrain(currentY, eyeballRadius, screenHeight - eyeballRadius);
-
-    float eyeHeightRatio = 1.0f;
-    switch (blinkState) {
-      case OPEN:
-        blinkTimer += frameDelay;
-        if (blinkTimer > openBlinkThreshold) { blinkTimer = 0; blinkState = CLOSING; }
-        break;
-      case CLOSING:
-        blinkTimer += frameDelay;
-        eyeHeightRatio = 1.0f - (float)blinkTimer / 80.0f;
-        if (eyeHeightRatio <= 0.0f) { eyeHeightRatio = 0.0f; blinkState = CLOSED; blinkTimer = 0; }
-        break;
-      case CLOSED:
-        blinkTimer += frameDelay;
-        eyeHeightRatio = 0.0f;
-        if (blinkTimer > 50) { blinkState = OPENING; blinkTimer = 0; }
-        break;
-      case OPENING:
-        blinkTimer += frameDelay;
-        eyeHeightRatio = (float)blinkTimer / 80.0f;
-        if (eyeHeightRatio >= 1.0f) { blinkState = OPEN; blinkTimer = 0; }
-        break;
-    }
-
-    drawEye(true, currentX, currentY, eyeHeightRatio);
-  }
-  
-  u8g2.sendBuffer();
+u8g2.clearBuffer();
+if (currentMode == ENTERTAINMENT_MODE) {
+// Entertainment Mode OLED
+u8g2.setDrawColor(0);
+u8g2.drawBox(0, 0, screenWidth, screenHeight); // Black background
+if (startupAnimation) {
+// Animate "Let's Dance" from right to left
+u8g2.setFont(u8g2_font_fub20_tf);
+u8g2.setDrawColor(1); // White text
+const char* text = "Let's Dance";
+u8g2.drawStr((int)textX, centerY + 10, text);
+textX -= textSpeed;
+if (textX < -100) {
+startupAnimation = false; // End animation
+shapeX = centerX; // Reset shape position
+shapeY = centerY;
 }
-
+u8g2.sendBuffer();
+return;
+}
+// Switch shapes every 5 seconds
+if (millis() - lastShapeSwitch >= SHAPE_SWITCH_INTERVAL) {
+currentShape = (ShapeType)((currentShape + 1) % 3); // Cycle: CIRCLE -> HEART -> TRIANGLE
+lastShapeSwitch = millis();
+}
+// Update shape position
+float targetX = shapeX;
+float targetY = shapeY;
+bool isMoving = false;
+if (currentMove == STOPPED_E) {
+if (millis() - lastIdleMove >= 1000) {
+lastIdleMove = millis();
+idleDirection = random(4); // 0: left, 1: right, 2: up, 3: down
+}
+switch (idleDirection) {
+case 0: targetX -= 2.0; isMoving = true; break; // Left
+case 1: targetX += 2.0; isMoving = true; break; // Right
+case 2: targetY -= 2.0; isMoving = true; break; // Up
+case 3: targetY += 2.0; isMoving = true; break; // Down
+}
+} else {
+switch (currentMove) {
+case FORWARD_E: targetY -= 2.0; isMoving = true; break; // Up
+case BACKWARD_E: targetY += 2.0; isMoving = true; break; // Down
+case TURN_LEFT_E: targetX -= 2.0; isMoving = true; break; // Left
+case TURN_RIGHT_E: targetX += 2.0; isMoving = true; break; // Right
+case SPIN_E: targetX += 2.0; isMoving = true; break; // Right
+default: break;
+}
+}
+// Smooth movement
+if (abs(targetX - shapeX) > 2.0) shapeX += (targetX > shapeX) ? 2.0 : -2.0;
+else shapeX = targetX;
+if (abs(targetY - shapeY) > 2.0) shapeY += (targetY > shapeY) ? 2.0 : -2.0;
+else shapeY = targetY;
+// Constrain position for larger shapes
+shapeX = constrain(shapeX, 40, screenWidth - 40);
+shapeY = constrain(shapeY, 40, screenHeight - 40);
+// Update text display
+if (isMoving) {
+lastMoveTime = millis();
+showText = false;
+} else if (millis() - lastMoveTime >= TEXT_DELAY) {
+showText = true;
+}
+// Draw content
+if (showText) {
+u8g2.setFont(u8g2_font_fub20_tf); // Larger font
+u8g2.setDrawColor(1); // White text
+const char* text = "Let's Dance";
+int textWidth = u8g2.getStrWidth(text);
+u8g2.drawStr((screenWidth - textWidth) / 2, centerY + 10, text); // Centered
+} else {
+// Blink shape
+if (shapeVisible && millis() - lastBlink >= BLINK_ON) {
+shapeVisible = false;
+lastBlink = millis();
+} else if (!shapeVisible && millis() - lastBlink >= BLINK_OFF) {
+shapeVisible = true;
+lastBlink = millis();
+}
+drawShape();
+}
+} else if (currentMode == GAME_MODE) {
+// Game Mode OLED
+if (inManualMode) {
+// Manual mode eye movement
+static char lastCommand = 'S';
+if (pendingCmd != "") {
+lastCommand = pendingCmd[0];
+pendingCmd = "";
+}
+if (millis() - lastMoveTime >= moveInterval) {
+switch (lastCommand) {
+case 'F':
+offsetY -= 1; // Eye moves up
+break;
+case 'L':
+offsetX -= 1; // Eye moves left
+break;
+case 'R':
+offsetX += 1; // Eye moves right
+break;
+default:
+// No movement for backward or stop
+break;
+}
+offsetX = constrain(offsetX, -10, 10);
+offsetY = constrain(offsetY, -10, 10);
+lastMoveTime = millis();
+}
+} else if (digitalRead(rmf) == LOW && digitalRead(rmb) == LOW && digitalRead(lmf) == LOW && digitalRead(lmb) == LOW) {
+// Stopped state: eye blinks, moves in one direction, and centers
+centerX = 90; // Center the eye
+centerY = 70;
+offsetX = 0;
+offsetY = 0;
+if (millis() - lastMoveTime >= moveInterval) {
+offsetX += directionX;
+if (offsetX > 10 || offsetX < -10) {
+directionX = -directionX;
+isBlinking = true;
+}
+lastMoveTime = millis();
+}
+} else {
+// Line following: eye moves in a triangle
+if (millis() - lastMoveTime >= moveInterval) {
+static const int16_t trianglePoints[3][2] = {{97, 40}, {67, 100}, {127, 100}}; // Top, bottom-left, bottom-right
+centerX = trianglePoints[triangleVertex][0];
+centerY = trianglePoints[triangleVertex][1];
+triangleVertex = (triangleVertex + 1) % 3;
+offsetX = 0;
+offsetY = 0;
+lastMoveTime = millis();
+}
+}
+// Handle blinking
+if (isBlinking) {
+drawGameEye(centerX + offsetX, centerY + offsetY, true);
+blinkFrameCount++;
+if (blinkFrameCount > blinkDuration) {
+isBlinking = false;
+blinkFrameCount = 0;
+}
+} else {
+drawGameEye(centerX + offsetX, centerY + offsetY, false);
+// Trigger faster blinks randomly
+if (random(100) < 30) { // 30% chance per frame to blink
+isBlinking = true;
+blinkFrameCount = 0;
+}
+}
+} else {
+// Play Mode OLED (eye behavior)
+int targetX = centerX;
+int targetY = centerY;
+float verticalOffset = 50;
+if (currentRobotState == STOP) {
+unsigned long currentTime = millis();
+if (currentTime - lastIdleMove >= 1000) {
+lastIdleMove = currentTime;
+idleDirection++;
+if (idleDirection > 8) idleDirection = 0;
+}
+if (idleDirection == 1) targetX = centerX - 25;
+else if (idleDirection == 3) targetX = centerX + 25;
+else if (idleDirection == 5) targetY = centerY - verticalOffset;
+else if (idleDirection == 7) targetY = centerY + verticalOffset;
+} else {
+switch (currentRobotState) {
+case FORWARD:  targetY = centerY - verticalOffset; break;
+case BACKWARD: targetY = centerY + verticalOffset; break;
+case LEFT:     targetX = centerX - 25; break;
+case RIGHT:    targetX = centerX + 25; break;
+default: break;
+}
+}
+if (abs(targetX - currentX) > moveSpeed)
+currentX += (targetX > currentX) ? moveSpeed : -moveSpeed;
+else
+currentX = targetX;
+if (abs(targetY - currentY) > moveSpeed)
+currentY += (targetY > currentY) ? moveSpeed : -moveSpeed;
+else
+currentY = targetY;
+currentX = constrain(currentX, eyeballRadius, screenWidth - eyeballRadius);
+currentY = constrain(currentY, eyeballRadius, screenHeight - eyeballRadius);
+float eyeHeightRatio = 1.0f;
+switch (blinkState) {
+case OPEN:
+blinkTimer += frameDelay;
+if (blinkTimer > 400) { blinkTimer = 0; blinkState = CLOSING; }
+break;
+case CLOSING:
+blinkTimer += frameDelay;
+eyeHeightRatio = 1.0f - (float)blinkTimer / 80.0f;
+if (eyeHeightRatio <= 0.0f) { eyeHeightRatio = 0.0f; blinkState = CLOSED; blinkTimer = 0; }
+break;
+case CLOSED:
+blinkTimer += frameDelay;
+eyeHeightRatio = 0.0f;
+if (blinkTimer > 50) { blinkState = OPENING; blinkTimer = 0; }
+break;
+case OPENING:
+blinkTimer += frameDelay;
+eyeHeightRatio = (float)blinkTimer / 80.0f;
+if (eyeHeightRatio >= 1.0f) { blinkState = OPEN; blinkTimer = 0; }
+break;
+}
+drawEye(true, currentX, currentY, eyeHeightRatio);
+}
+u8g2.sendBuffer();
+}
+// ===== Game Mode Functions =====
+// Game Mode Hand Servo Control
+void handleHandServos() {
+static unsigned long lastServoMove = 0;
+static bool waveUp = true;
+const unsigned long waveInterval = 1000; // Slower wave every 1000ms
+if (millis() - lastServoMove >= waveInterval) {
+if (waveUp) {
+leftArmServo.write(45);  // Left hand wave up
+rightArmServo.write(45);  // Right hand wave up
+} else {
+leftArmServo.write(135); // Left hand wave down
+rightArmServo.write(135); // Right hand wave down
+}
+waveUp = !waveUp; // Toggle wave direction
+lastServoMove = millis();
+}
+}
+// Game Mode Obstacle Handler
+void handleObstacle() {
+stopMotors();
+Serial.println("🚧 Obstacle detected");
+if (!obstacleToggle) {
+loadingBlueOnly(); // Blue loading animation during servo actions
+loadingRed();
+delay(1000);
+gripperServo1.write(35);
+delay(1500);
+gripperServo2.write(180);
+leftArmServo.write(45);  // Wave up
+delay(500);
+leftArmServo.write(135); // Wave down
+delay(500);
+leftArmServo.write(90);  // Return to neutral
+delay(1000);
+} else {
+loadingYellowOnly(); // Yellow loading animation during servo actions
+loadingRed();
+delay(1000);
+gripperServo2.write(0);
+delay(1500);
+gripperServo1.write(0);
+rightArmServo.write(45);  // Wave up
+delay(500);
+rightArmServo.write(135); // Wave down
+delay(500);
+rightArmServo.write(90);  // Return to neutral
+delay(1000);
+moveBackwardGame();
+delay(1300);
+stopMotors();
+}
+obstacleToggle = !obstacleToggle; // Flip mode
+}
+// Game Mode Line Following
+void lineFollowing() {
+int sensorValues[NUM_SENSORS];
+int error = 0, total = 0;
+bool allSensorsLow = true;
+// Read sensors
+for (int i = 0; i < NUM_SENSORS; i++) {
+sensorValues[i] = digitalRead(sensorPins[i]);
+if (sensorValues[i] == HIGH) allSensorsLow = false;
+}
+// If line lost → stop
+if (allSensorsLow) {
+stopMotors();
+rotatingColors();
+return;
+}
+// Calculate error
+for (int i = 0; i < NUM_SENSORS; i++) {
+if (sensorValues[i] == HIGH) {
+error += (i - 2) * 100;
+total++;
+}
+}
+if (total > 0) error /= total;
+// PID control
+integral += error;
+float derivative = error - lastError;
+float output = Kp * error + Ki * integral + Kd * derivative;
+lastError = error;
+int leftSpeed = constrain(baseSpeed - output, 0, 255);
+int rightSpeed = constrain(baseSpeed + output, 0, 255);
+// Apply motor control
+if (error > 0) {
+// Turn right
+digitalWrite(rmf, HIGH);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, HIGH);
+handleHandServos(); // Wave hands during movement
+} else if (error < 0) {
+// Turn left
+digitalWrite(rmf, LOW);
+digitalWrite(rmb, HIGH);
+digitalWrite(lmf, HIGH);
+digitalWrite(lmb, LOW);
+handleHandServos(); // Wave hands during movement
+} else {
+// Forward
+digitalWrite(rmf, HIGH);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, HIGH);
+digitalWrite(lmb, LOW);
+handleHandServos(); // Wave hands during movement
+}
+flashingBlueYellow(); // Blue and yellow flashing when line following
+}
+// Game Mode Movement Functions
+void moveForwardGame() {
+digitalWrite(rmf, HIGH);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, HIGH);
+digitalWrite(lmb, LOW);
+handleHandServos(); // Wave hands during movement
+Serial.println("Forward");
+loadingGreen(); // Green loading when moving forward in manual mode
+}
+void moveBackwardGame() {
+digitalWrite(rmf, LOW);
+digitalWrite(rmb, HIGH);
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, HIGH);
+handleHandServos(); // Wave hands during movement
+Serial.println("Backward");
+flashingRed(); // Flashing red when moving backward
+}
+void turnLeftGame() {
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, LOW);
+digitalWrite(rmf, HIGH);
+digitalWrite(rmb, LOW);
+handleHandServos(); // Wave hands during movement
+Serial.println("Left");
+flashingRed(); // Flashing red when turning left
+}
+void turnRightGame() {
+digitalWrite(lmf, HIGH);
+digitalWrite(lmb, LOW);
+digitalWrite(rmf, LOW);
+digitalWrite(rmb, LOW);
+handleHandServos(); // Wave hands during movement
+Serial.println("Right");
+flashingRed(); // Flashing red when turning right
+}
+// Game Mode LED Effects
+void rotatingColors() {
+static uint8_t hue = 0;
+for(int i = 0; i < NUM_LEDS; i++) {
+leds[i] = CHSV((hue + (i * 255 / NUM_LEDS)) % 255, 255, 255);
+}
+hue += 5; // Rotate colors
+}
+void solidBlueYellow() {
+for(int i = 0; i < NUM_LEDS; i++) {
+if(i % 2 == 0) {
+leds[i] = CRGB::Blue;
+} else {
+leds[i] = CRGB::Yellow;
+}
+}
+}
+void flashingBlueYellow() {
+static bool isBlue = true;
+static unsigned long lastFlash = 0;
+const unsigned long flashInterval = 500; // Flash every 500ms
+if (millis() - lastFlash >= flashInterval) {
+isBlue = !isBlue; // Toggle color
+lastFlash = millis();
+}
+fill_solid(leds, NUM_LEDS, isBlue ? CRGB::Blue : CRGB::Yellow);
+}
+void loadingBlueYellow() {
+static uint8_t pos = 0;
+fill_solid(leds, NUM_LEDS, CRGB::Black);
+for(int i = 0; i < 4; i++) {
+int index = (pos + i) % NUM_LEDS;
+if(i % 2 == 0) {
+leds[index] = CRGB::Blue;
+} else {
+leds[index] = CRGB::Yellow;
+}
+}
+pos = (pos + 1) % NUM_LEDS;
+}
+void loadingBlueOnly() {
+static uint8_t pos = 0;
+fill_solid(leds, NUM_LEDS, CRGB::Black);
+for(int i = 0; i < 4; i++) {
+leds[(pos + i) % NUM_LEDS] = CRGB::Blue;
+}
+pos = (pos + 1) % NUM_LEDS;
+}
+void loadingYellowOnly() {
+static uint8_t pos = 0;
+fill_solid(leds, NUM_LEDS, CRGB::Black);
+for(int i = 0; i < 4; i++) {
+leds[(pos + i) % NUM_LEDS] = CRGB::Yellow;
+}
+pos = (pos + 1) % NUM_LEDS;
+}
+void flashingRed() {
+static bool isRed = true;
+static unsigned long lastFlash = 0;
+const unsigned long flashInterval = 500; // Flash every 500ms
+if (millis() - lastFlash >= flashInterval) {
+isRed = !isRed; // Toggle color
+lastFlash = millis();
+}
+fill_solid(leds, NUM_LEDS, isRed ? CRGB::Red : CRGB::Black);
+}
+void loadingGreen() {
+static uint8_t pos = 0;
+fill_solid(leds, NUM_LEDS, CRGB::Black);
+for(int i = 0; i < 4; i++) {
+leds[(pos + i) % NUM_LEDS] = CRGB::Green;
+}
+pos = (pos + 1) % NUM_LEDS;
+}
+void loadingRed() {
+static uint8_t pos = 0;
+fill_solid(leds, NUM_LEDS, CRGB::Black);
+for(int i = 0; i < 4; i++) {
+leds[(pos + i) % NUM_LEDS] = CRGB::Red;
+}
+pos = (pos + 1) % NUM_LEDS;
+}
 // ===== Play Mode LED Effects =====
 void loadingEffectPlay() {
-  static int pos = 0;
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  leds[pos] = CRGB::Blue;
-  FastLED.show();
-  pos = (pos + 1) % NUM_LEDS;
+static int pos = 0;
+fill_solid(leds, NUM_LEDS, CRGB::Black);
+leds[pos] = CRGB::Blue;
+FastLED.show();
+pos = (pos + 1) % NUM_LEDS;
 }
-
 void forwardEffectPlay() {
-  static int pos = 0;
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  leds[pos] = CRGB::Green;
-  leds[(pos + 1) % NUM_LEDS] = CRGB::White;
-  FastLED.show();
-  pos = (pos + 1) % NUM_LEDS;
+static int pos = 0;
+fill_solid(leds, NUM_LEDS, CRGB::Black);
+leds[pos] = CRGB::Green;
+leds[(pos + 1) % NUM_LEDS] = CRGB::White;
+FastLED.show();
+pos = (pos + 1) % NUM_LEDS;
 }
-
 void backwardEffectPlay() {
-  static bool on = false;
-  if (on) {
-    fill_solid(leds, NUM_LEDS, CRGB::Red);
-  } else {
-    fill_solid(leds, NUM_LEDS, CRGB::Black);
-  }
-  on = !on;
-  FastLED.show();
+static bool on = false;
+if (on) {
+fill_solid(leds, NUM_LEDS, CRGB::Red);
+} else {
+fill_solid(leds, NUM_LEDS, CRGB::Black);
 }
-
+on = !on;
+FastLED.show();
+}
 void turnEffectPlay() {
-  static uint8_t brightness = 200;
-  static int dir = 5;
-  brightness += dir;
-  if (brightness >= 255 || brightness <= 0) dir = -dir;
-  fill_solid(leds, NUM_LEDS, CRGB(0, 0, brightness));
-  FastLED.show();
+static uint8_t brightness = 200;
+static int dir = 5;
+brightness += dir;
+if (brightness >= 255 || brightness <= 0) dir = -dir;
+fill_solid(leds, NUM_LEDS, CRGB(0, 0, brightness));
+FastLED.show();
 }
-
 // ===== Play Mode Arm Waving =====
 void waveHandsPlay() {
-  if (!waving) return;
-
-  unsigned long currentTime = millis();
-  if (currentTime - lastWaveTime >= 5) {  // Faster updates
-    lastWaveTime = currentTime;
-
-    servoPos += increment;
-    if (servoPos >= 120 || servoPos <= 60) {
-      increment = -increment;
-    }
-
-    leftArmServo.write(servoPos);
-    rightArmServo.write(servoPos);
-  }
+if (!waving) return;
+unsigned long currentTime = millis();
+if (currentTime - lastWaveTime >= 5) {  // Faster updates
+lastWaveTime = currentTime;
+servoPos += increment;
+if (servoPos >= 120 || servoPos <= 60) {
+increment = -increment;
 }
-
+leftArmServo.write(servoPos);
+rightArmServo.write(servoPos);
+}
+}
 // ===== Play Mode Movement Functions =====
 void moveForwardPlay() {
-  digitalWrite(RMF, HIGH);
-  digitalWrite(RMB, LOW);
-  digitalWrite(LMF, HIGH);
-  digitalWrite(LMB, LOW);
-  waving = true;
-  currentRobotState = FORWARD;
-  Serial.println("Play Mode: Moving Forward");
+digitalWrite(rmf, HIGH);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, HIGH);
+digitalWrite(lmb, LOW);
+waving = true;
+currentRobotState = FORWARD;
+Serial.println("Play Mode: Moving Forward");
 }
-
 void moveBackwardPlay() {
-  digitalWrite(RMF, LOW);
-  digitalWrite(RMB, HIGH);
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, HIGH);
-  waving = true;
-  currentRobotState = BACKWARD;
-  Serial.println("Play Mode: Moving Backward");
+digitalWrite(rmf, LOW);
+digitalWrite(rmb, HIGH);
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, HIGH);
+waving = true;
+currentRobotState = BACKWARD;
+Serial.println("Play Mode: Moving Backward");
 }
-
 void turnLeftPlay() {
-  digitalWrite(RMF, LOW);
-  digitalWrite(RMB, HIGH);
-  digitalWrite(LMF, HIGH);
-  digitalWrite(LMB, LOW);
-  waving = false;
-  currentRobotState = LEFT;
-  Serial.println("Play Mode: Turning Left");
+digitalWrite(rmf, LOW);
+digitalWrite(rmb, HIGH);
+digitalWrite(lmf, HIGH);
+digitalWrite(lmb, LOW);
+waving = false;
+currentRobotState = LEFT;
+Serial.println("Play Mode: Turning Left");
 }
-
 void turnRightPlay() {
-  digitalWrite(RMF, HIGH);
-  digitalWrite(RMB, LOW);
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, HIGH);
-  waving = false;
-  currentRobotState = RIGHT;
-  Serial.println("Play Mode: Turning Right");
+digitalWrite(rmf, HIGH);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, HIGH);
+waving = false;
+currentRobotState = RIGHT;
+Serial.println("Play Mode: Turning Right");
 }
-
 void stopMotorsPlay() {
-  stopMotors();
-  waving = false;
-  Serial.println("Play Mode: Stopped");
+stopMotors();
+waving = false;
+Serial.println("Play Mode: Stopped");
 }
-
-// ===== Entertainment Mode Motor Movements =====
+// ===== Entertainment Mode Functions =====
+// Entertainment Mode Motor Movements
 void moveForwardEntertain() {
-  digitalWrite(RMF, HIGH);
-  digitalWrite(RMB, LOW);
-  digitalWrite(LMF, HIGH);
-  digitalWrite(LMB, LOW);
-  currentMove = FORWARD_E;
+digitalWrite(rmf, HIGH);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, HIGH);
+digitalWrite(lmb, LOW);
+currentMove = FORWARD_E;
 }
-
 void moveBackwardEntertain() {
-  digitalWrite(RMF, LOW);
-  digitalWrite(RMB, HIGH);
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, HIGH);
-  currentMove = BACKWARD_E;
+digitalWrite(rmf, LOW);
+digitalWrite(rmb, HIGH);
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, HIGH);
+currentMove = BACKWARD_E;
 }
-
 void turnLeftEntertain() {
-  digitalWrite(RMF, HIGH);
-  digitalWrite(RMB, LOW);
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, HIGH);
-  currentMove = TURN_LEFT_E;
+digitalWrite(rmf, HIGH);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, HIGH);
+currentMove = TURN_LEFT_E;
 }
-
 void turnRightEntertain() {
-  digitalWrite(RMF, LOW);
-  digitalWrite(RMB, HIGH);
-  digitalWrite(LMF, HIGH);
-  digitalWrite(LMB, LOW);
-  currentMove = TURN_RIGHT_E;
+digitalWrite(rmf, LOW);
+digitalWrite(rmb, HIGH);
+digitalWrite(lmf, HIGH);
+digitalWrite(lmb, LOW);
+currentMove = TURN_RIGHT_E;
 }
-
 void stopMotorsEntertain() {
-  digitalWrite(RMF, LOW);
-  digitalWrite(RMB, LOW);
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, LOW);
-  currentMove = STOPPED_E;
+digitalWrite(rmf, LOW);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, LOW);
+currentMove = STOPPED_E;
 }
-
 void spinAroundEntertain() {
-  digitalWrite(RMF, HIGH);
-  digitalWrite(RMB, LOW);
-  digitalWrite(LMF, LOW);
-  digitalWrite(LMB, HIGH);
-  currentMove = SPIN_E;
-  delay(800);
+digitalWrite(rmf, HIGH);
+digitalWrite(rmb, LOW);
+digitalWrite(lmf, LOW);
+digitalWrite(lmb, HIGH);
+currentMove = SPIN_E;
+delay(800);
 }
-
 // Entertainment Mode Servo Actions
 void waveHandsUpDown() {
-  leftArmServo.write(45);
-  rightArmServo.write(135);
-  delay(300);
-  leftArmServo.write(135);
-  rightArmServo.write(45);
-  delay(300);
+leftArmServo.write(45);
+rightArmServo.write(135);
+delay(300);
+leftArmServo.write(135);
+rightArmServo.write(45);
+delay(300);
 }
-
 void waveHandsAlt() {
-  leftArmServo.write(45);
-  rightArmServo.write(90);
-  delay(300);
-  leftArmServo.write(90);
-  rightArmServo.write(135);
-  delay(300);
+leftArmServo.write(45);
+rightArmServo.write(90);
+delay(300);
+leftArmServo.write(90);
+rightArmServo.write(135);
+delay(300);
 }
-
 void waveHandsTogether() {
-  leftArmServo.write(45);
-  rightArmServo.write(45);
-  delay(300);
-  leftArmServo.write(135);
-  rightArmServo.write(135);
-  delay(300);
+leftArmServo.write(45);
+rightArmServo.write(45);
+delay(300);
+leftArmServo.write(135);
+rightArmServo.write(135);
+delay(300);
 }
-
 // Entertainment Mode LED Animation
 void updateLEDPattern() {
-  if (millis() - lastLEDUpdate < 100) return; // 100ms update
-  lastLEDUpdate = millis();
-
-  static int offset = 0;
-  offset++;
-
-  switch (currentMove) {
-    case FORWARD_E:
-    case BACKWARD_E:
-      for (int i = 0; i < NUM_LEDS; i++) {
-        leds[(i + offset) % NUM_LEDS] = (i % 2 == 0) ? minionYellow : minionBlue;
-      }
-      break;
-
-    case TURN_LEFT_E:
-      for (int i = 0; i < NUM_LEDS; i++) {
-        leds[(i + offset) % NUM_LEDS] = (i % 2 == 0) ? minionBlue : minionYellow;
-      }
-      break;
-
-    case TURN_RIGHT_E:
-    case SPIN_E:
-      for (int i = 0; i < NUM_LEDS; i++) {
-        leds[(i - offset + NUM_LEDS) % NUM_LEDS] = (i % 2 == 0) ? minionYellow : minionBlue;
-      }
-      break;
-
-    default:
-      break;
-  }
-
-  FastLED.show();
+if (millis() - lastLEDUpdate < 100) return; // 100ms update
+lastLEDUpdate = millis();
+static int offset = 0;
+offset++;
+switch (currentMove) {
+case FORWARD_E:
+case BACKWARD_E:
+for (int i = 0; i < NUM_LEDS; i++) {
+leds[(i + offset) % NUM_LEDS] = (i % 2 == 0) ? minionYellow : minionBlue;
 }
-
+break;
+case TURN_LEFT_E:
+for (int i = 0; i < NUM_LEDS; i++) {
+leds[(i + offset) % NUM_LEDS] = (i % 2 == 0) ? minionBlue : minionYellow;
+}
+break;
+case TURN_RIGHT_E:
+case SPIN_E:
+for (int i = 0; i < NUM_LEDS; i++) {
+leds[(i - offset + NUM_LEDS) % NUM_LEDS] = (i % 2 == 0) ? minionYellow : minionBlue;
+}
+break;
+default:
+break;
+}
+FastLED.show();
+}
 // Entertainment Mode Servo Motion when Motors Run
 void updateServoMotion() {
-  if (millis() - lastServoUpdate < 100) return; // 100ms per update
-  lastServoUpdate = millis();
-
-  // Move in opposite directions
-  if (servoDirection) {
-    leftAngle += 5;
-    rightAngle -= 5;
-  } else {
-    leftAngle -= 5;
-    rightAngle += 5;
-  }
-
-  if (leftAngle >= 135 || leftAngle <= 45) {
-    servoDirection = !servoDirection; // reverse direction
-  }
-
-  leftArmServo.write(leftAngle);
-  rightArmServo.write(rightAngle);
+if (millis() - lastServoUpdate < 100) return; // 100ms per update
+lastServoUpdate = millis();
+// Move in opposite directions
+if (servoDirection) {
+leftAngle += 5;
+rightAngle -= 5;
+} else {
+leftAngle -= 5;
+rightAngle += 5;
 }
-
+if (leftAngle >= 135 || leftAngle <= 45) {
+servoDirection = !servoDirection; // reverse direction
+}
+leftArmServo.write(leftAngle);
+rightArmServo.write(rightAngle);
+}
 // Entertainment Mode Dance Routines
 void danceRoutine1() {
-  static unsigned long lastStepTime = 0;
-  static int step = 0;
-  unsigned long interval = 1500;
-
-  if (millis() - lastStepTime >= interval) {
-    lastStepTime = millis();
-    step++;
-    if (step > 8) step = 1;
-
-    switch (step) {
-      case 1: moveForwardEntertain(); break;
-      case 2: moveBackwardEntertain(); break;
-      case 3: turnLeftEntertain(); break;
-      case 4: turnRightEntertain(); break;
-      case 5: stopMotorsEntertain(); waveHandsUpDown(); break;
-      case 6: moveForwardEntertain(); break;
-      case 7: moveBackwardEntertain(); break;
-      case 8: stopMotorsEntertain(); waveHandsAlt(); break;
-    }
-  }
+static unsigned long lastStepTime = 0;
+static int step = 0;
+unsigned long interval = 1500;
+if (millis() - lastStepTime >= interval) {
+lastStepTime = millis();
+step++;
+if (step > 8) step = 1;
+switch (step) {
+case 1: moveForwardEntertain(); break;
+case 2: moveBackwardEntertain(); break;
+case 3: turnLeftEntertain(); break;
+case 4: turnRightEntertain(); break;
+case 5: stopMotorsEntertain(); waveHandsUpDown(); break;
+case 6: moveForwardEntertain(); break;
+case 7: moveBackwardEntertain(); break;
+case 8: stopMotorsEntertain(); waveHandsAlt(); break;
 }
-
+}
+}
 void danceRoutine2() {
-  static unsigned long lastStepTime = 0;
-  static int step = 0;
-  unsigned long interval = 1200;
-
-  if (millis() - lastStepTime >= interval) {
-    lastStepTime = millis();
-    step++;
-    if (step > 8) step = 1;
-
-    switch (step) {
-      case 1: moveForwardEntertain(); break;
-      case 2: moveBackwardEntertain(); break;
-      case 3: turnRightEntertain(); break;
-      case 4: turnLeftEntertain(); break;
-      case 5: spinAroundEntertain(); break;
-      case 6: stopMotorsEntertain(); waveHandsAlt(); break;
-      case 7: moveForwardEntertain(); break;
-      case 8: stopMotorsEntertain(); waveHandsTogether(); break;
-    }
-  }
+static unsigned long lastStepTime = 0;
+static int step = 0;
+unsigned long interval = 1200;
+if (millis() - lastStepTime >= interval) {
+lastStepTime = millis();
+step++;
+if (step > 8) step = 1;
+switch (step) {
+case 1: moveForwardEntertain(); break;
+case 2: moveBackwardEntertain(); break;
+case 3: turnRightEntertain(); break;
+case 4: turnLeftEntertain(); break;
+case 5: spinAroundEntertain(); break;
+case 6: stopMotorsEntertain(); waveHandsAlt(); break;
+case 7: moveForwardEntertain(); break;
+case 8: stopMotorsEntertain(); waveHandsTogether(); break;
 }
-
-// ===== Execute Game Mode (Updated with provided code) =====
-void executeGameMode() {
-  if (hasResult) {
-    stopNowGame();
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB24_tr);
-    const char* text = match ? "Win!" : "Fail";
-    int16_t textWidth = u8g2.getStrWidth(text);
-    u8g2.drawStr((128 - textWidth) / 2, 64, text);
-    u8g2.sendBuffer();
-    fill_solid(leds, NUM_LEDS, match ? CRGB::Green : CRGB::Red);
-    FastLED.show();
-    delay(100);
-  } else {
-    u8g2.clearBuffer();
-
-    // Check for Bluetooth SPP command
-    if (pendingCmd != "") {
-      handleBTCommand(pendingCmd);
-      pendingCmd = "";
-    }
-
-    // If in manual mode, check if 0.75s passed
-    if (inManualMode) {
-      if (millis() - manualStartTime >= manualDuration) {
-        inManualMode = false; // back to line following
-        stopNowGame();         // stop before resuming line following
-      }
-    }
-
-    updateOLED();
-
-    // If not in manual → line following
-    if (!inManualMode) {
-      // Ultrasonic check
-      long distance = getDistance();
-      if ((obstacleToggle && distance > 0 && distance <= 10) || (!obstacleToggle && distance > 0 && distance <= 5)) {
-        handleObstacle();
-      } else {
-        lineFollowing();
-      }
-    }
-
-    // Update LED animations
-    EVERY_N_MILLISECONDS(20) {
-      gHue++; // Slowly cycle the "base color"
-    }
-    FastLED.show();
-    delay(100);
-  }
 }
-
+}
 // ===== Mode Switching Functions =====
 void switchToGameMode() {
-  // Cleanup
-  stopMotors();
-  clearLEDs();
-  neutralArms();
-  gripperServo1.write(0);
-  gripperServo2.write(0);
-
-  // Initialize Game Mode
-  currentMode = GAME_MODE;
-  gameSubMode = LINE_FOLLOWING;
-  inManualMode = false;
-  hasResult = false;
-  match = false;
-  digit1 = "";
-  digit2 = "";
-  obstacleToggle = false;
-  lastError = 0;
-  integral = 0;
-  motorSpeed = 75;
-  isBlinking = false;
-  blinkFrameCount = 0;
-  triangleVertex = 0;
-  lastMoveTime = 0;
-  currentX = centerX;
-  currentY = centerY;
-  offsetX = 0;
-  offsetY = 0;
-  currentRobotState = STOP;
-
-  // Connect to WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.println("WiFi connected!");
-  Serial.print("ESP32 IP address: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.println("Switched to Game Mode");
-  SerialBT.println("Game Mode Activated");
+// Cleanup
+stopMotors();
+clearLEDs();
+neutralArms();
+gripperServo1.write(0);
+gripperServo2.write(0);
+// Initialize Game Mode
+currentMode = GAME_MODE;
+inManualMode = false;
+manualStartTime = 0;
+obstacleToggle = false;
+baseSpeed = 120;
+lastError = 0;
+integral = 0;
+centerX = 90;
+centerY = 70;
+offsetX = 0;
+offsetY = 0;
+triangleVertex = 0;
+lastMoveTime = millis();
+isBlinking = false;
+blinkFrameCount = 0;
+currentRobotState = STOP;
+motorSpeed = 75;
+Serial.println("Switched to Game Mode");
+SerialBT.println("Game Mode Activated");
 }
-
 void switchToPlayMode() {
-  // Cleanup
-  stopMotors();
-  clearLEDs();
-  neutralArms();
-  gripperServo1.write(0);
-  gripperServo2.write(0);
-
-  // Initialize Play Mode
-  currentMode = PLAY_MODE;
-  turning = false;
-  waving = false;
-  servoPos = 60;
-  increment = 10;
-  lastWaveTime = 0;
-  idleDirection = 0;
-  lastIdleMove = 0;
-  blinkState = OPEN;
-  blinkTimer = 0;
-  currentX = centerX;
-  currentY = centerY;
-  currentRobotState = STOP;
-  motorSpeed = 100;  // Full speed for Play Mode
-  Serial.println("Switched to Play Mode");
-  SerialBT.println("Play Mode Activated");
-  Serial.println("Play Mode: Confirming currentMode = PLAY_MODE");
+// Cleanup
+stopMotors();
+clearLEDs();
+neutralArms();
+gripperServo1.write(0);
+gripperServo2.write(0);
+// Initialize Play Mode
+currentMode = PLAY_MODE;
+turning = false;
+waving = false;
+servoPos = 60;
+increment = 10;
+lastWaveTime = 0;
+idleDirection = 0;
+lastIdleMove = 0;
+blinkState = OPEN;
+blinkTimer = 0;
+currentX = centerX;
+currentY = centerY;
+currentRobotState = STOP;
+motorSpeed = 100;  // Full speed for Play Mode
+Serial.println("Switched to Play Mode");
+SerialBT.println("Play Mode Activated");
+Serial.println("Play Mode: Confirming currentMode = PLAY_MODE");
 }
-
 void switchToEntertainmentMode() {
-  // Cleanup
-  stopMotors();
-  clearLEDs();
-  neutralArms();
-  gripperServo1.write(0);
-  gripperServo2.write(0);
-
-  // Initialize Entertainment Mode
-  currentMode = ENTERTAINMENT_MODE;
-  danceMode = 1;
-  danceStartTime = millis();
-  lastLEDUpdate = 0;
-  lastServoUpdate = 0;
-  leftAngle = 60;
-  rightAngle = 120;
-  servoDirection = true;
-  currentMove = STOPPED_E;
-  motorSpeed = 100;  // Full speed for Entertainment Mode
-  
-  // Reset OLED animation variables
-  startupAnimation = true;
-  textX = screenWidth + 100;
-  shapeX = centerX;
-  shapeY = centerY;
-  currentShape = CIRCLE;
-  lastShapeSwitch = millis();
-  shapeVisible = true;
-  lastBlink = millis();
-  showText = false;
-  lastMoveTime = millis();
-  idleDirection = 0;
-  lastIdleMove = millis();
-  
-  Serial.println("Switched to Entertainment Mode");
-  SerialBT.println("Entertainment Mode Activated - Let's Dance!");
+// Cleanup
+stopMotors();
+clearLEDs();
+neutralArms();
+gripperServo1.write(0);
+gripperServo2.write(0);
+// Initialize Entertainment Mode
+currentMode = ENTERTAINMENT_MODE;
+danceMode = 1;
+danceStartTime = millis();
+lastLEDUpdate = 0;
+lastServoUpdate = 0;
+leftAngle = 60;
+rightAngle = 120;
+servoDirection = true;
+currentMove = STOPPED_E;
+motorSpeed = 100;  // Full speed for Entertainment Mode
+// Reset OLED animation variables
+startupAnimation = true;
+textX = screenWidth + 100;
+shapeX = centerX;
+shapeY = centerY;
+currentShape = CIRCLE;
+lastShapeSwitch = millis();
+shapeVisible = true;
+lastBlink = millis();
+showText = false;
+lastMoveTime = millis();
+idleDirection = 0;
+lastIdleMove = millis();
+Serial.println("Switched to Entertainment Mode");
+SerialBT.println("Entertainment Mode Activated - Let's Dance!");
 }
-
+// ===== Execute Game Mode =====
+void executeGameMode() {
+// Check for new commands every loop iteration
+if (pendingCmd != "") {
+String cmd_str = pendingCmd;
+pendingCmd = "";
+cmd_str.trim();
+Serial.printf("Game Mode: Received Command = %s\n", cmd_str.c_str());
+if (cmd_str.length() == 1) {
+char cmd = cmd_str[0];
+switch (cmd) {
+case 'F':
+moveForwardGame();
+inManualMode = true;
+manualStartTime = millis();
+currentRobotState = FORWARD;
+SerialBT.println("Moving Forward");
+break;
+case 'B':
+moveBackwardGame();
+inManualMode = true;
+manualStartTime = millis();
+currentRobotState = BACKWARD;
+SerialBT.println("Moving Backward");
+break;
+case 'L':
+turnLeftGame();
+delay(1300); // Turn for 1 second
+stopMotors();
+inManualMode = false; // Immediately go back to line following
+currentRobotState = STOP;
+SerialBT.println("Turning Left");
+break;
+case 'R':
+turnRightGame();
+delay(1300); // Turn for 1 second
+stopMotors();
+inManualMode = false; // Immediately go back to line following
+currentRobotState = STOP;
+SerialBT.println("Turning Right");
+break;
+case 'S':
+stopMotors();
+inManualMode = true;
+manualStartTime = millis();
+currentRobotState = STOP;
+SerialBT.println("Stopped");
+break;
+default:
+SerialBT.println("Unknown command");
+Serial.println("Game Mode: Unknown command ignored");
+break;
+}
+} else {
+SerialBT.println("Unknown command");
+Serial.println("Game Mode: Invalid command length, ignored");
+}
+} else {
+Serial.println("Game Mode: No pending command");
+}
+// Check if manual mode duration has expired
+if (inManualMode && millis() - manualStartTime >= manualDuration) {
+inManualMode = false; // Back to line following
+stopMotors();         // Stop before resuming line following
+}
+// If not in manual mode → line following
+if (!inManualMode) {
+// Ultrasonic check
+float distance = getDistance();
+if (distance > 0 && ((obstacleToggle && distance <= 10) || (!obstacleToggle && distance <= 4))) {
+Serial.printf("Game Mode: Obstacle detected at %.2f cm, triggering handleObstacle\n", distance);
+handleObstacle();
+} else if (distance == -1) {
+Serial.println("Game Mode: Invalid ultrasonic reading, continuing line following");
+lineFollowing();
+} else {
+Serial.printf("Game Mode: No obstacle (distance = %.2f cm), continuing line following\n", distance);
+lineFollowing();
+}
+}
+// Update LED animations
+EVERY_N_MILLISECONDS(20) {
+gHue++; // Slowly cycle the "base color"
+}
+updateOLED();
+FastLED.show();
+delay(frameDelay);
+}
 // ===== Execute Play Mode =====
 void executePlayMode() {
-  // Debug: Log current state periodically
-  static unsigned long lastDebug = 0;
-  if (millis() - lastDebug >= 1000) {
-    String stateStr;
-    switch (currentRobotState) {
-      case STOP: stateStr = "STOP"; break;
-      case FORWARD: stateStr = "FORWARD"; break;
-      case BACKWARD: stateStr = "BACKWARD"; break;
-      case LEFT: stateStr = "LEFT"; break;
-      case RIGHT: stateStr = "RIGHT"; break;
-    }
-    Serial.printf("Play Mode: Current State = %s, Distance = %.2f cm\n", stateStr.c_str(), getDistance());
-    lastDebug = millis();
-  }
-
-  // Check for new commands
-  if (pendingCmd != "") {
-    String cmd_str = pendingCmd;
-    pendingCmd = "";
-    cmd_str.trim();
-    Serial.printf("Play Mode: Received Command = %s\n", cmd_str.c_str());
-
-    if (cmd_str.length() == 1) {
-      char cmd = cmd_str[0];
-      switch (cmd) {
-        case 'f': moveForwardPlay(); SerialBT.println("Moving Forward"); break;
-        case 'b': moveBackwardPlay(); SerialBT.println("Moving Backward"); break;
-        case 'l': turnLeftPlay(); neutralArms(); SerialBT.println("Turning Left"); break;
-        case 'r': turnRightPlay(); neutralArms(); SerialBT.println("Turning Right"); break;
-        case 's': stopMotorsPlay(); neutralArms(); SerialBT.println("Stopped"); break;
-        default: SerialBT.println("Unknown command"); Serial.println("Play Mode: Unknown command ignored"); break;
-      }
-    } else {
-      SerialBT.println("Unknown command");
-      Serial.println("Play Mode: Invalid command length, ignored");
-    }
-  }
-
-  // Ultrasonic sensor obstacle handling
-  float distance = getDistance();
-  if (!turning && distance > 0 && distance <= 10 && currentRobotState != STOP) {
-    stopMotorsPlay();
-    SerialBT.println("Obstacle detected in Play Mode!");
-    Serial.println("Play Mode: Obstacle detected, stopping and turning right");
-    turnRightPlay();
-    turning = true;
-    turnStartTime = millis();
-  }
-  if (turning && millis() - turnStartTime >= 100) {
-    Serial.println("Play Mode: Resuming previous state after turn");
-    switch (currentRobotState) {
-      case FORWARD: moveForwardPlay(); break;
-      case BACKWARD: moveBackwardPlay(); break;
-      case LEFT: turnLeftPlay(); neutralArms(); break;
-      case RIGHT: turnRightPlay(); neutralArms(); break;
-      case STOP: stopMotorsPlay(); neutralArms(); break;
-    }
-    turning = false;
-  }
-
-  // Continue executing current robot state
-  switch (currentRobotState) {
-    case FORWARD: moveForwardPlay(); break;
-    case BACKWARD: moveBackwardPlay(); break;
-    case LEFT: turnLeftPlay(); neutralArms(); break;
-    case RIGHT: turnRightPlay(); neutralArms(); break;
-    case STOP: stopMotorsPlay(); neutralArms(); break;
-  }
-
-  waveHandsPlay();
-
-  // Update LEDs based on current state
-  switch (currentRobotState) {
-    case STOP: loadingEffectPlay(); break;
-    case FORWARD: forwardEffectPlay(); break;
-    case BACKWARD: backwardEffectPlay(); break;
-    case LEFT:
-    case RIGHT: turnEffectPlay(); break;
-  }
-
-  updateOLED();
-  delay(frameDelay);
+// Debug: Log current state periodically
+static unsigned long lastDebug = 0;
+if (millis() - lastDebug >= 1000) {
+String stateStr;
+switch (currentRobotState) {
+case STOP: stateStr = "STOP"; break;
+case FORWARD: stateStr = "FORWARD"; break;
+case BACKWARD: stateStr = "BACKWARD"; break;
+case LEFT: stateStr = "LEFT"; break;
+case RIGHT: stateStr = "RIGHT"; break;
 }
-
+Serial.printf("Play Mode: Current State = %s, Distance = %.2f cm\n", stateStr.c_str(), getDistance());
+lastDebug = millis();
+}
+// Check for new commands
+if (pendingCmd != "") {
+String cmd_str = pendingCmd;
+pendingCmd = "";
+cmd_str.trim();
+Serial.printf("Play Mode: Received Command = %s\n", cmd_str.c_str());
+if (cmd_str.length() == 1) {
+char cmd = cmd_str[0];
+switch (cmd) {
+case 'f': moveForwardPlay(); SerialBT.println("Moving Forward"); break;
+case 'b': moveBackwardPlay(); SerialBT.println("Moving Backward"); break;
+case 'l': turnLeftPlay(); neutralArms(); SerialBT.println("Turning Left"); break;
+case 'r': turnRightPlay(); neutralArms(); SerialBT.println("Turning Right"); break;
+case 's': stopMotorsPlay(); neutralArms(); SerialBT.println("Stopped"); break;
+default: SerialBT.println("Unknown command"); Serial.println("Play Mode: Unknown command ignored"); break;
+}
+} else {
+SerialBT.println("Unknown command");
+Serial.println("Play Mode: Invalid command length, ignored");
+}
+}
+// Ultrasonic sensor obstacle handling
+float distance = getDistance();
+if (!turning && distance > 0 && distance <= 10 && currentRobotState != STOP) {
+stopMotorsPlay();
+SerialBT.println("Obstacle detected in Play Mode!");
+Serial.println("Play Mode: Obstacle detected, stopping and turning right");
+turnRightPlay();
+turning = true;
+turnStartTime = millis();
+}
+if (turning && millis() - turnStartTime >= 100) {
+Serial.println("Play Mode: Resuming previous state after turn");
+switch (currentRobotState) {
+case FORWARD: moveForwardPlay(); break;
+case BACKWARD: moveBackwardPlay(); break;
+case LEFT: turnLeftPlay(); neutralArms(); break;
+case RIGHT: turnRightPlay(); neutralArms(); break;
+case STOP: stopMotorsPlay(); neutralArms(); break;
+}
+turning = false;
+}
+// Continue executing current robot state
+switch (currentRobotState) {
+case FORWARD: moveForwardPlay(); break;
+case BACKWARD: moveBackwardPlay(); break;
+case LEFT: turnLeftPlay(); neutralArms(); break;
+case RIGHT: turnRightPlay(); neutralArms(); break;
+case STOP: stopMotorsPlay(); neutralArms(); break;
+}
+waveHandsPlay();
+// Update LEDs based on current state
+switch (currentRobotState) {
+case STOP: loadingEffectPlay(); break;
+case FORWARD: forwardEffectPlay(); break;
+case BACKWARD: backwardEffectPlay(); break;
+case LEFT:
+case RIGHT: turnEffectPlay(); break;
+}
+updateOLED();
+delay(frameDelay);
+}
 // ===== Execute Entertainment Mode =====
 void executeEntertainmentMode() {
-  // Switch dance modes every 3 minutes
-  if (millis() - danceStartTime >= DANCE_DURATION) {
-    danceMode = (danceMode == 1) ? 2 : 1;
-    danceStartTime = millis();
-    Serial.printf("Entertainment Mode: Switching to Dance %d\n", danceMode);
-    SerialBT.printf("Switching to Dance %d\n", danceMode);
-  }
-
-  // Update LEDs and Servos if motors are running
-  if (currentMove != STOPPED_E) {
-    updateLEDPattern();
-    updateServoMotion();
-  } else {
-    FastLED.clear();
-    FastLED.show();
-    leftArmServo.write(90);
-    rightArmServo.write(90);
-  }
-
-  // Update OLED
-  updateOLED();
-
-  // Execute dance routines
-  if (danceMode == 1) {
-    danceRoutine1();
-  } else {
-    danceRoutine2();
-  }
-
-  delay(frameDelay); // Ensure smooth OLED animation
+// Switch dance modes every 3 minutes
+if (millis() - danceStartTime >= DANCE_DURATION) {
+danceMode = (danceMode == 1) ? 2 : 1;
+danceStartTime = millis();
+Serial.printf("Entertainment Mode: Switching to Dance %d\n", danceMode);
+SerialBT.printf("Switching to Dance %d\n", danceMode);
 }
-
+// Update LEDs and Servos if motors are running
+if (currentMove != STOPPED_E) {
+updateLEDPattern();
+updateServoMotion();
+} else {
+FastLED.clear();
+FastLED.show();
+leftArmServo.write(90);
+rightArmServo.write(90);
+}
+// Update OLED
+updateOLED();
+// Execute dance routines
+if (danceMode == 1) {
+danceRoutine1();
+} else {
+danceRoutine2();
+}
+delay(frameDelay); // Ensure smooth OLED animation
+}
 // ===== Setup =====
 void setup() {
-  Serial.begin(115200);
-  Serial.println("Unified Robot Starting...");
-
-  // Pin modes
-  pinMode(RMF, OUTPUT); pinMode(RMB, OUTPUT);
-  pinMode(LMF, OUTPUT); pinMode(LMB, OUTPUT);
-  pinMode(S1, INPUT); pinMode(S2, INPUT); pinMode(S3, INPUT);
-  pinMode(S4, INPUT); pinMode(S5, INPUT);
-  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
-
-  // Servos
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-  
-  gripperServo1.setPeriodHertz(50);
-  gripperServo2.setPeriodHertz(50);
-  leftArmServo.setPeriodHertz(50);
-  rightArmServo.setPeriodHertz(50);
-  
-  gripperServo1.attach(SERVO_GRIPPER1_PIN, 500, 2400); gripperServo1.write(0);
-  gripperServo2.attach(SERVO_GRIPPER2_PIN, 500, 2400); gripperServo2.write(0);
-  leftArmServo.attach(SERVO_LEFT_ARM_PIN, 500, 2400); leftArmServo.write(90);
-  rightArmServo.attach(SERVO_RIGHT_ARM_PIN, 500, 2400); rightArmServo.write(90);
-
-  // Bluetooth Serial
-  SerialBT.begin("ESP32_SPEAKER");
-  Serial.println("Bluetooth initialized: ESP32_SPEAKER");
-
-  // LEDs
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
-  FastLED.setBrightness(BRIGHTNESS);
-  startupAnimation();
-
-  // OLED
-  Wire.begin(21, 22);
-  u8g2.begin();
-
-  // Audio
-  auto cfg = i2s.defaultConfig();
-  cfg.pin_bck  = 12;
-  cfg.pin_ws   = 13;
-  cfg.pin_data = 26;
-  i2s.begin(cfg);
-
-  a2dp_sink.set_on_connection_state_changed(connection_state_changed);
-  a2dp_sink.start("ESP32_SPEAKER");
-  a2dp_sink.set_volume(0x7F);  // Max volume
-
-  // Initial mode
-  switchToGameMode();  // Default to Game Mode
-
-  Serial.println("Robot Ready!");
-  delay(1000);
+Serial.begin(115200);
+Serial.println("Unified Robot Starting...");
+// Pin modes
+pinMode(rmf, OUTPUT); pinMode(rmb, OUTPUT);
+pinMode(lmf, OUTPUT); pinMode(lmb, OUTPUT);
+pinMode(S1, INPUT); pinMode(S2, INPUT); pinMode(S3, INPUT);
+pinMode(S4, INPUT); pinMode(S5, INPUT);
+pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+// Servos
+ESP32PWM::allocateTimer(0);
+ESP32PWM::allocateTimer(1);
+ESP32PWM::allocateTimer(2);
+ESP32PWM::allocateTimer(3);
+gripperServo1.setPeriodHertz(50);
+gripperServo2.setPeriodHertz(50);
+leftArmServo.setPeriodHertz(50);
+rightArmServo.setPeriodHertz(50);
+gripperServo1.attach(SERVO_GRIPPER1_PIN, 500, 2400); gripperServo1.write(0);
+gripperServo2.attach(SERVO_GRIPPER2_PIN, 500, 2400); gripperServo2.write(0);
+leftArmServo.attach(SERVO_LEFT_ARM_PIN, 500, 2400); leftArmServo.write(90);
+rightArmServo.attach(SERVO_RIGHT_ARM_PIN, 500, 2400); rightArmServo.write(90);
+// Bluetooth Serial
+SerialBT.begin("ESP32_SPEAKER");
+Serial.println("Bluetooth initialized: ESP32_SPEAKER");
+// LEDs
+FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+FastLED.setBrightness(BRIGHTNESS);
+clearLEDs();
+// OLED
+Wire.begin(21, 22);
+u8g2.begin();
+// Audio
+auto cfg = i2s.defaultConfig();
+cfg.pin_bck  = 12;
+cfg.pin_ws   = 13;
+cfg.pin_data = 26;
+i2s.begin(cfg);
+a2dp_sink.set_on_connection_state_changed(connection_state_changed);
+a2dp_sink.start("ESP32_SPEAKER");
+a2dp_sink.set_volume(0x7F);  // Max volume
+// Initial mode
+switchToPlayMode();  // Default to Play Mode
+Serial.println("Robot Ready!");
+delay(1000);
 }
-
 // ===== Main Loop =====
 void loop() {
-  // Debug: Log current mode and Bluetooth status periodically
-  static unsigned long lastStatusCheck = 0;
-  if (millis() - lastStatusCheck >= 1000) {
-    String modeStr;
-    switch (currentMode) {
-      case GAME_MODE: modeStr = "GAME_MODE"; break;
-      case PLAY_MODE: modeStr = "PLAY_MODE"; break;
-      case ENTERTAINMENT_MODE: modeStr = "ENTERTAINMENT_MODE"; break;
-    }
-    Serial.printf("Current Mode: %s, Bluetooth Status: %s\n", 
-                  modeStr.c_str(), 
-                  SerialBT.connected() ? "Connected" : "Disconnected");
-    lastStatusCheck = millis();
-  }
-
-  // Check for Bluetooth commands
-  if (SerialBT.available()) {
-    String cmd = SerialBT.readStringUntil('\n');
-    if (cmd.length() > 0) {
-      Serial.printf("Main Loop: Bluetooth Raw Command = '%s' (length = %d)\n", cmd.c_str(), cmd.length());
-      cmd.trim();
-      Serial.printf("Main Loop: Bluetooth Trimmed Command = '%s'\n", cmd.c_str());
-
-      if (cmd == "G") {
-        Serial.println("Main Loop: Switching to Game Mode via Bluetooth");
-        switchToGameMode();
-        SerialBT.println("Game Mode Activated");
-      } else if (cmd == "M") {
-        Serial.println("Main Loop: Switching to Play Mode via Bluetooth");
-        switchToPlayMode();
-        SerialBT.println("Play Mode Activated");
-      } else if (cmd == "E") {
-        Serial.println("Main Loop: Switching to Entertainment Mode via Bluetooth");
-        switchToEntertainmentMode();
-        SerialBT.println("Entertainment Mode Activated - Let's Dance!");
-      } else {
-        Serial.printf("Main Loop: Passing Bluetooth command '%s' to mode handler\n", cmd.c_str());
-        pendingCmd = cmd;  // Pass to mode handler
-      }
-    } else {
-      Serial.println("Main Loop: Empty Bluetooth command received, ignoring");
-    }
-  }
-
-  // Check for USB Serial commands (for testing)
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    if (cmd.length() > 0) {
-      Serial.printf("Main Loop: USB Serial Raw Command = '%s' (length = %d)\n", cmd.c_str(), cmd.length());
-      cmd.trim();
-      Serial.printf("Main Loop: USB Serial Trimmed Command = '%s'\n", cmd.c_str());
-
-      if (cmd == "G") {
-        Serial.println("Main Loop: Switching to Game Mode via USB Serial");
-        switchToGameMode();
-        SerialBT.println("Game Mode Activated");
-        Serial.println("Game Mode Activated");
-      } else if (cmd == "M") {
-        Serial.println("Main Loop: Switching to Play Mode via USB Serial");
-        switchToPlayMode();
-        SerialBT.println("Play Mode Activated");
-        Serial.println("Play Mode Activated");
-      } else if (cmd == "E") {
-        Serial.println("Main Loop: Switching to Entertainment Mode via USB Serial");
-        switchToEntertainmentMode();
-        SerialBT.println("Entertainment Mode Activated - Let's Dance!");
-        Serial.println("Entertainment Mode Activated");
-      } else {
-        Serial.printf("Main Loop: Passing USB Serial command '%s' to mode handler\n", cmd.c_str());
-        pendingCmd = cmd;  // Pass to mode handler
-      }
-    } else {
-      Serial.println("Main Loop: Empty USB Serial command received, ignoring");
-    }
-  }
-
-  // Execute current mode
-  if (currentMode == GAME_MODE) {
-    executeGameMode();
-  } else if (currentMode == PLAY_MODE) {
-    executePlayMode();
-  } else if (currentMode == ENTERTAINMENT_MODE) {
-    executeEntertainmentMode();
-  }
-
-  // Temporarily disable disconnection handling for testing
-  /*
-  if (!SerialBT.connected()) {
-    stopMotors();
-    neutralArms();
-    clearLEDs();
-    Serial.println("Bluetooth disconnected, stopping robot");
-  }
-  */
+// Debug: Log current mode and Bluetooth status periodically
+static unsigned long lastStatusCheck = 0;
+if (millis() - lastStatusCheck >= 1000) {
+String modeStr;
+switch (currentMode) {
+case GAME_MODE: modeStr = "GAME_MODE"; break;
+case PLAY_MODE: modeStr = "PLAY_MODE"; break;
+case ENTERTAINMENT_MODE: modeStr = "ENTERTAINMENT_MODE"; break;
+}
+Serial.printf("Current Mode: %s, Bluetooth Status: %s\n",
+modeStr.c_str(),
+SerialBT.connected() ? "Connected" : "Disconnected");
+lastStatusCheck = millis();
+}
+// Check for Bluetooth commands
+if (SerialBT.available()) {
+String cmd = SerialBT.readStringUntil('\n');
+if (cmd.length() > 0) {
+Serial.printf("Main Loop: Bluetooth Raw Command = '%s' (length = %d)\n", cmd.c_str(), cmd.length());
+cmd.trim();
+Serial.printf("Main Loop: Bluetooth Trimmed Command = '%s'\n", cmd.c_str());
+if (cmd == "G") {
+Serial.println("Main Loop: Switching to Game Mode via Bluetooth");
+switchToGameMode();
+SerialBT.println("Game Mode Activated");
+} else if (cmd == "M") {
+Serial.println("Main Loop: Switching to Play Mode via Bluetooth");
+switchToPlayMode();
+SerialBT.println("Play Mode Activated");
+} else if (cmd == "E") {
+Serial.println("Main Loop: Switching to Entertainment Mode via Bluetooth");
+switchToEntertainmentMode();
+SerialBT.println("Entertainment Mode Activated - Let's Dance!");
+} else {
+Serial.printf("Main Loop: Passing Bluetooth command '%s' to mode handler\n", cmd.c_str());
+pendingCmd = cmd;  // Pass to mode handler
+}
+} else {
+Serial.println("Main Loop: Empty Bluetooth command received, ignoring");
+}
+}
+// Check for USB Serial commands (for testing)
+if (Serial.available()) {
+String cmd = Serial.readStringUntil('\n');
+if (cmd.length() > 0) {
+Serial.printf("Main Loop: USB Serial Raw Command = '%s' (length = %d)\n", cmd.c_str(), cmd.length());
+cmd.trim();
+Serial.printf("Main Loop: USB Serial Trimmed Command = '%s'\n", cmd.c_str());
+if (cmd == "G") {
+Serial.println("Main Loop: Switching to Game Mode via USB Serial");
+switchToGameMode();
+SerialBT.println("Game Mode Activated");
+Serial.println("Game Mode Activated");
+} else if (cmd == "M") {
+Serial.println("Main Loop: Switching to Play Mode via USB Serial");
+switchToPlayMode();
+SerialBT.println("Play Mode Activated");
+Serial.println("Play Mode Activated");
+} else if (cmd == "E") {
+Serial.println("Main Loop: Switching to Entertainment Mode via USB Serial");
+switchToEntertainmentMode();
+SerialBT.println("Entertainment Mode Activated - Let's Dance!");
+Serial.println("Entertainment Mode Activated");
+} else {
+Serial.printf("Main Loop: Passing USB Serial command '%s' to mode handler\n", cmd.c_str());
+pendingCmd = cmd;  // Pass to mode handler
+}
+} else {
+Serial.println("Main Loop: Empty USB Serial command received, ignoring");
+}
+}
+// Execute current mode
+if (currentMode == GAME_MODE) {
+executeGameMode();
+} else if (currentMode == PLAY_MODE) {
+executePlayMode();
+} else if (currentMode == ENTERTAINMENT_MODE) {
+executeEntertainmentMode();
+}
 }
